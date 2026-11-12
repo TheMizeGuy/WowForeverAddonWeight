@@ -144,6 +144,9 @@ The first rows settle things the source cannot: paste `/weight status` after doi
 | Which reading carries the blame | `/weight status` after a few stutters blamed on an addon | counts for "the stutter's own frame" and "the frame after" |
 | A memory scan's cost | `/weight status` with the window open | "last took N ms"; under 10 is normal |
 | The window draws right | `/weight` | tiles, striped rows, headers with a sort arrow, the alert icon on heavy rows, nothing overlapping |
+| The sort arrow fits the narrow headers | `/run for i,h in ipairs(AddonWeightFrame.headers) do print(i, h.arrow:GetWidth(), h.Text:GetLeft()-h:GetLeft()-3-h.arrow:GetWidth()) end` | the last number 2 or more on every line |
+| The report opens at its top | `/weight report`, then `/dump AddonWeightReportFrame.scroll:GetVerticalScroll()` | 0 |
+| The row stripes show | `/dump C_Texture.GetAtlasInfo("auctionhouse-rowstripe-1")` | a table, and alternating stripes in the list |
 | Load times | `/reload`, then sort by Load ms | the big addons (quest database, guides) at the top |
 | Frame time | sort by Average ms, stand still, then fight | figures move; Combat ms fills in |
 | Stutter blame | open the world map or a big addon window for the first time | the Stutters tile names that addon, or says the frame was charged to none |

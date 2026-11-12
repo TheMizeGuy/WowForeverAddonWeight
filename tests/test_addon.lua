@@ -1271,7 +1271,11 @@ T.test("a row shows the addon's figures, why it stands out, and marks estimates 
     Open()
     wow.Run(6)
     local cells = Row("Alpha").cells
-    T.eq(cells.name.text, "Alpha |TInterface\\DialogFrame\\DialogIcon-AlertNew-16:16:16|t")
+    T.eq(cells.name.text, "Alpha")
+    T.eq(cells.name.width, 144, "room for the alert icon")
+    T.eq(Row("Alpha").alert:IsShown(), true)
+    T.eq(Row("Bravo").alert:IsShown(), false)
+    T.eq(Row("Bravo").cells.name.width, 164)
     T.eq(cells.average.text, "1.25")
     T.eq(cells.combat.text, "-")
     T.eq(cells.peak.text, "-")

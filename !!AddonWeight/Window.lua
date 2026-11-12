@@ -369,6 +369,11 @@ end
 
 local function BuildRow(row)
     row.cells = {}
+    -- A button's normal texture draws on the artwork layer, over the bar and level with the text.
+    local stripe = row:GetNormalTexture()
+    if stripe then
+        stripe:SetDrawLayer("BACKGROUND")
+    end
     row.bar = row:CreateTexture(nil, "BORDER")
     row.bar:SetColorTexture(1, 1, 1, 0.1)
     row.bar:SetHeight(15)
@@ -382,6 +387,11 @@ local function BuildRow(row)
         row.cells[column.key] = cell
         x = x + column.width
     end
+    -- Its own texture at a fixed place: after a long title a font string would cut it off.
+    row.alert = row:CreateTexture(nil, "ARTWORK")
+    row.alert:SetTexture("Interface\\DialogFrame\\DialogIcon-AlertNew-16")
+    row.alert:SetSize(16, 16)
+    row.alert:SetPoint("RIGHT", row, "LEFT", COLUMNS[1].width - 6, 0)
     row:SetScript("OnEnter", function(self)
         view.hover = self
         ShowRowTooltip(self)
@@ -408,7 +418,10 @@ local function InitRow(row, rec)
     if stripe then
         stripe:SetAtlas((view.position[rec] or 1) % 2 == 1 and "auctionhouse-rowstripe-1" or "auctionhouse-rowstripe-2")
     end
-    row.cells.name:SetText(rec.level == 2 and rec.title .. " " .. ALERT or rec.title)
+    local heavy = rec.level == 2
+    row.cells.name:SetWidth(COLUMNS[1].width - (heavy and 36 or 16))
+    row.cells.name:SetText(rec.title)
+    row.alert:SetShown(heavy)
     local barShown = false
     for _, column in ipairs(COLUMNS) do
         if column.key ~= "name" then
@@ -646,10 +659,13 @@ end
 
 local function BuildWindow()
     window = Panel("AddonWeightFrame", ns.TITLE, WIDTH, HEIGHT)
+    -- The meter keeps the position itself; the client's own layout cache must not add a second anchor.
     window:SetScript("OnDragStop", function(self)
         self:StopMovingOrSizing()
+        self:SetUserPlaced(false)
         SavePosition(self)
     end)
+    window:ClearAllPoints()
     local saved = ns.db.window.point
     if type(saved) == "table" and type(saved[1]) == "string" and type(saved[2]) == "string"
         and type(saved[3]) == "number" and type(saved[4]) == "number" then
@@ -742,8 +758,12 @@ function ns.ShowReport()
     if not report then
         report = Panel("AddonWeightReportFrame", ns.TITLE .. ": text", 900, 480)
         report:SetFrameStrata("DIALOG")
+        report:ClearAllPoints()
         report:SetPoint("CENTER")
-        report:SetScript("OnDragStop", report.StopMovingOrSizing)
+        report:SetScript("OnDragStop", function(self)
+            self:StopMovingOrSizing()
+            self:SetUserPlaced(false)
+        end)
         local scroll = CreateFrame("ScrollFrame", nil, report, "InputScrollFrameTemplate")
         scroll:SetPoint("TOPLEFT", 15, -35)
         scroll:SetPoint("BOTTOMRIGHT", -35, 35)
@@ -752,7 +772,7 @@ function ns.ShowReport()
         end
         local box = scroll.EditBox
         box:SetFontObject("ChatFontNormal")
-        box:SetWidth(840)
+        box:SetWidth(832)
         box:SetScript("OnEscapePressed", function()
             report:Hide()
         end)
