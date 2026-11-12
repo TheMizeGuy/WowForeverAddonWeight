@@ -680,6 +680,32 @@ T.test("with the window closed a peak just before a loading screen is still foun
     T.eq(alpha.peakSeen, 950, "read at the latest ten rounds on")
 end)
 
+T.test("in the quiet seconds after a loading screen its frames are not shown or saved as hitches or a peak", function()
+    local ns = Settled()
+    Open()
+    local alpha = ns.addons.Alpha
+    wow.Fire("LOADING_SCREEN_ENABLED")
+    wow.Metric("Alpha", "CountTimeOver50Ms", 3)
+    wow.Metric("Alpha", "CountTimeOver100Ms", 2)
+    wow.Frame(2)
+    wow.Fire("LOADING_SCREEN_DISABLED")
+    wow.Run(1)
+    local row
+    for _, candidate in ipairs(_G.AddonWeightFrame.scrollBox.rows) do
+        if candidate.rec == alpha then
+            row = candidate
+        end
+    end
+    row.scripts.OnEnter(row)
+    T.ok(wow.Tooltip("Frames over 5 / 10 / 50 / 100 ms: 0 / 0 / 0 / 0"))
+    T.eq(ns.Over(alpha, 4), 0)
+    _G.AddonWeightFrame.Tabs[2]:Click()
+    T.eq(ns.db.stats.Alpha.band, 0)
+    T.eq(ns.db.stats.Alpha.hitches, 0)
+    wow.Fire("PLAYER_LOGOUT")
+    T.eq(ns.db.stats.Alpha.band, 0)
+end)
+
 T.test("an exact peak smaller than a mark a later frame passed gives way to that mark", function()
     local ns = Settled()
     Open()

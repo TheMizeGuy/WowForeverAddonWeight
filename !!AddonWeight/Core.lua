@@ -838,6 +838,11 @@ function ns.Over(rec, bucket)
     if not now then
         return nil
     end
+    -- While a loading screen is being set aside, what the counters gained behind it does not count.
+    local hold = rec.hold
+    if hold and hold[1] then
+        now = min(now, hold[bucket])
+    end
     return max(0, now - (rec.base[bucket] or 0))
 end
 
