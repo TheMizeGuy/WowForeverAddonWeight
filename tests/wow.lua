@@ -101,6 +101,17 @@ function widget.CreateTexture(self, name, layer)
     return wow.NewWidget("Texture", name, self)
 end
 function widget.IsMouseOver(self) return self.mouseOver == true end
+function widget.GetNormalTexture(self)
+    local texture = rawget(self, "normalTexture")
+    if not texture then
+        texture = wow.NewWidget("Texture", nil, self)
+        self.normalTexture = texture
+    end
+    return texture
+end
+function widget.SetAtlas(self, atlas) self.atlas = atlas end
+function widget.SetCursorPosition(self, position) self.cursor = position end
+function widget.SetVerticalScroll(self, offset) self.scroll = offset end
 function widget.SetOwner(self, owner, anchor)
     self.owner = owner
     wow.tooltip = {}
@@ -148,6 +159,8 @@ local function CreateFrame(kind, name, parent, template)
     if template == "DefaultPanelTemplate" then
         frame.TitleContainer = { TitleText = wow.NewWidget("FontString") }
         frame.shown = true
+    elseif template == "ColumnDisplayButtonShortTemplate" then
+        frame.Text = wow.NewWidget("FontString", nil, frame)
     elseif template == "InputScrollFrameTemplate" then
         frame.EditBox = wow.NewWidget("EditBox", nil, frame)
         frame.CharCount = wow.NewWidget("FontString", nil, frame)
@@ -242,12 +255,17 @@ function wow.Reset(options)
     G.UISpecialFrames = {}
     G.GameTooltip = wow.NewWidget("GameTooltip", "GameTooltip")
     G.GameTooltip_Hide = function() G.GameTooltip:Hide() end
+    G.GameTooltip_AddInstructionLine = function(tooltip, text) tooltip:AddLine(text) end
+    G.GameTooltip_AddNormalLine = function(tooltip, text) tooltip:AddLine(text) end
+    G.PixelUtil = { GetNearestPixelSize = function(value) return math.floor(value + 0.5) end }
     G.PlaySound = NoOp
     G.SOUNDKIT = setmetatable({}, { __index = function() return 1 end })
     G.InCombatLockdown = function() return wow.combat end
     G.GetFramerate = function() return wow.fps end
     G.IsCpuBound = function() return wow.cpuBound end
     G.GetBuildInfo = function() return "1.60.1", "70888", "Nov 10 2026", 16001 end
+    G.UnitGUID = function() return "Player-1-0000ABCD" end
+    G.AceEvent30Frame, G.AceAddon30Frame = nil, nil
     G.ReloadUI = function() wow.reloaded = true end
     G.StaticPopup_ShowGenericConfirmation = function(text, callback)
         wow.popup = { text = text, accept = callback }
@@ -286,7 +304,10 @@ function wow.Reset(options)
             local entry = Entry(key)
             return entry and field == "Version" and entry.version or nil
         end,
-        DisableAddOn = function(name) wow.disabled[#wow.disabled + 1] = name end,
+        DisableAddOn = function(name, character)
+            wow.disabled[#wow.disabled + 1] = name
+            wow.disabledFor = character
+        end,
     }
 
     local function Read(name, metric)
@@ -413,10 +434,11 @@ function wow.Frame(seconds)
     end
 end
 
--- `seconds` of ordinary frames, `fps` to the second. The default 16 keeps the suite quick and its
--- frame length exact in binary, so waits of whole seconds end on the frame they should.
+-- `seconds` of ordinary frames, `fps` to the second. The default 64 has a frame length exact in
+-- binary, so waits of whole seconds end on the frame they should; the profiler is sampled every
+-- 60 frames, which at 64 a second is 16 samples in 15 seconds.
 function wow.Run(seconds, fps)
-    fps = fps or 16
+    fps = fps or 64
     for _ = 1, math.floor(seconds * fps + 0.5) do
         wow.Frame(1 / fps)
     end

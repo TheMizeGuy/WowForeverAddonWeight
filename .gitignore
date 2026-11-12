@@ -17,3 +17,4 @@ __pycache__/
 
 # downloaded client source and strings for tests/audit_globals.py
 /.cache/
+/.cache

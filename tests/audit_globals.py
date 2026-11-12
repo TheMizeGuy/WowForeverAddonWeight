@@ -42,6 +42,8 @@ select setmetatable tonumber tostring type unpack xpcall math string table corou
 # Globals the game engine creates itself rather than any UI file: the root frames and the slash
 # command table (Blizzard's own UI code uses all three throughout).
 ENGINE = {"UIParent", "WorldFrame", "SlashCmdList"}
+# Ace3's shared frames, which exist only when another addon has loaded Ace3; read through _G.
+ENGINE |= {"AceEvent30Frame", "AceAddon30Frame"}
 # Lua functions the WoW client adds to the global environment.
 WOW_LUA = set("""
 time date strbyte strchar strfind strgsub strlen strlower strmatch strrep strsub strupper format

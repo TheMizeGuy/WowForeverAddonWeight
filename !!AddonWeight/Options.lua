@@ -12,7 +12,7 @@ local CONTROLS = {
     {
         key = "memory",
         label = "Measure memory with the window closed",
-        tooltip = "One memory scan a minute, never in combat. Off, memory is only measured while the window is open, so garbage rates and growth start from then.",
+        tooltip = "One memory scan a minute, never in combat. Off, memory is only measured while the window is open. Scans a minute apart undercount how fast an addon makes new memory; the figure sharpens while the window is open.",
     },
     {
         key = "stutter",
@@ -23,7 +23,7 @@ local CONTROLS = {
         key = "stutterMs",
         slider = { ns.STUTTER_MIN, ns.STUTTER_MAX, ns.STUTTER_STEP },
         label = "A stutter is a frame longer than",
-        tooltip = "At 60 frames per second a frame lasts 17 ms. 100 ms is a hitch most people see.",
+        tooltip = "At 60 frames per second a frame lasts 17 ms. 100 ms is a stutter most people see. Changing this starts the stutter list over.",
     },
     {
         key = "stutterChat",
@@ -73,6 +73,7 @@ function ns.OpenOptions()
 end
 
 local function Top()
+    ns.SampleCPU(true, true)
     local rows = ns.Rows("weight")
     local shown = 0
     for _, rec in ipairs(rows) do
@@ -108,6 +109,9 @@ local COMMANDS = {
     end,
     help = function()
         ns.Say("/weight opens the window. /weight top names the heaviest addons in chat. /weight report gives the whole table as text to copy. /weight reset starts the averages over. /weight config opens the settings. /weight status is for troubleshooting.")
+    end,
+    copy = function()
+        ns.ShowReport()
     end,
 }
 COMMANDS.settings, COMMANDS.options = COMMANDS.config, COMMANDS.config

@@ -12,7 +12,7 @@ end
 local T0 = Clock()
 local HEAP0 = collectgarbage("count")
 
-local max, min, floor = math.max, math.min, math.floor
+local max, min, floor, exp = math.max, math.min, math.floor, math.exp
 
 ns.NAME = ADDON
 ns.TITLE = "Addon Weight"
@@ -35,43 +35,54 @@ ns.STUTTER_MIN, ns.STUTTER_MAX, ns.STUTTER_STEP = 40, 500, 10
 
 -- { noticeable, heavy } per measure.
 ns.LIMITS = {
-    cpu = { 0.3, 1.0 },         -- ms per frame, averaged
-    spike = { 1, 10 },          -- frames the addon alone held for over 50 ms
-    memory = { 20480, 76800 },  -- KB
-    growth = { 50, 250 },       -- KB per second
-    load = { 150, 500 },        -- ms
-    login = { 250, 1000 },      -- ms in one frame while loading
+    cpu = { 0.5, 1.0 },          -- ms per frame, averaged
+    growth = { 50, 250 },        -- KB per second
+    memory = { 51200, 204800 },  -- KB
+    load = { 150, 500 },         -- ms, files and saved settings
+    burst = { 250, 1000 },       -- ms in one go while loading
 }
+-- Frames the addon alone ran over 50 ms: { seen at least, an hour at least }.
+ns.SPIKES = { noticeable = { 2, 6 }, heavy = { 5, 60 } }
 
 ns.BUCKETS = { 1, 5, 10, 50, 100, 500, 1000 }
 local SPIKE_BUCKET = 4
+ns.SPIKE_BUCKET = SPIKE_BUCKET
 local BUCKET_METRICS = {
     "CountTimeOver1Ms", "CountTimeOver5Ms", "CountTimeOver10Ms", "CountTimeOver50Ms",
     "CountTimeOver100Ms", "CountTimeOver500Ms", "CountTimeOver1000Ms",
 }
 
-local CPU_INTERVAL_SHOWN, CPU_INTERVAL_HIDDEN = 1, 2
+-- The profiler's "recent" figure covers 60 frames, so one sample every 60 frames misses none.
+local SAMPLE_FRAMES = 60
+local COMBAT_MIN_SAMPLES = 10
 local MEMORY_INTERVAL_SHOWN, MEMORY_INTERVAL_HIDDEN, MEMORY_INTERVAL_SLOW = 5, 60, 15
 local MEMORY_SLOW_MS = 10
 local FIRST_MEMORY_DELAY = 2
+local MEMORY_SETTLE_MS = 60000
+local GROWTH_MEMORY_SECONDS = 120
 local QUIET_AFTER_LOADING_MS = 3000
 local STARTUP_TIMEOUT_MS = 10000
+local LOADING_LIMIT_MS = 120000
 local PAUSED_FRAME_SECONDS = 5
 local LEAK_MIN_KB, LEAK_MIN_SECONDS = 20480, 600
+local BLAME_SLACK = 1.1
 
 local db
 local frame = CreateFrame("Frame")
 ns.frame = frame
 
-local startup = { phase = "files", mark = T0, heapMark = HEAP0, loads = 0, t = { start = T0 } }
+local startup = { phase = "files", mark = T0, markFrames = 0, frames = 0, heapMark = HEAP0, loads = 0, t = { start = T0 } }
 ns.startup = startup
 ns.loading = true
+ns.loadingSince = T0
 ns.quietUntil = 0
 ns.frameMs = 0
 ns.frameStamp = T0
+ns.frameCount = 0
 ns.trackedSince = T0
 ns.memory = { scans = 0 }
 ns.cpu = { samples = 0 }
+ns.heap = { rise = 0 }
 ns.blame = { first = 0, second = 0 }
 
 local function Clean(text)
@@ -89,7 +100,7 @@ local function Record(name)
     if not rec then
         rec = {
             name = name, title = name, blizzard = name:find("^Blizzard_") ~= nil,
-            sum = 0, n = 0, combatSum = 0, combatN = 0, alloc = 0, stutters = 0,
+            sum = 0, n = 0, combatSum = 0, combatN = 0, stutters = 0,
             over = {}, base = {},
         }
         ns.addons[name] = rec
@@ -179,6 +190,19 @@ function ns.FormatClock(seconds)
     return ("%d:%02d"):format(seconds / 60, seconds % 60)
 end
 
+-- Cuts and pads by characters, never inside a UTF-8 sequence.
+function ns.Fit(text, width)
+    local out, count = {}, 0
+    for char in text:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+        if count == width then
+            break
+        end
+        count = count + 1
+        out[count] = char
+    end
+    return table.concat(out) .. (" "):rep(width - count)
+end
+
 -- Loading ----------------------------------------------------------------------------------
 
 local function LoadDatabase()
@@ -195,6 +219,17 @@ local function LoadDatabase()
     if type(db.history) ~= "table" then
         db.history = {}
     end
+    for name, runs in pairs(db.history) do
+        local kept = {}
+        if type(runs) == "table" then
+            for _, ms in ipairs(runs) do
+                if type(ms) == "number" then
+                    kept[#kept + 1] = ms
+                end
+            end
+        end
+        db.history[name] = #kept > 0 and kept or nil
+    end
     if type(db.logins) ~= "table" then
         db.logins = {}
     end
@@ -203,6 +238,26 @@ local function LoadDatabase()
     end
     db.schema = 1
     ns.db = db
+    ns.stutterMark = db.stutterMs
+end
+
+local function Mark()
+    startup.mark = Clock()
+    startup.markFrames = startup.frames
+    startup.heapMark = collectgarbage("count")
+end
+
+-- Ace3 keeps one event frame and one setup frame for every addon that uses it, and the client's
+-- profiler charges a frame's work to the addon that created the frame.
+local function NoteCarrier(rec)
+    if ns.carrier ~= nil or not (_G.AceEvent30Frame or _G.AceAddon30Frame) then
+        return
+    end
+    if rec.name == ADDON or rec.blizzard then
+        ns.carrier = false
+    else
+        ns.carrier, rec.carries = rec, "Ace3"
+    end
 end
 
 local function OnAddonLoaded(name)
@@ -217,19 +272,29 @@ local function OnAddonLoaded(name)
     end
     startup.loads = startup.loads + 1
     rec.loaded, rec.order = true, startup.loads
+    local sameFrame = startup.frames == startup.markFrames
     if startup.phase == "files" then
         -- An addon that loads on demand was asked for from another's code, whose time is in the gap too.
         local demanded = not rec.blizzard and C_AddOns.IsAddOnLoadOnDemand(name)
         rec.loadMs, rec.loadKind = max(0, now - startup.mark), demanded and "login" or "startup"
         rec.loadKB = max(0, heap - startup.heapMark)
         startup.t.files = now
+        if not sameFrame then
+            startup.split = (startup.split or 0) + 1
+        end
     elseif startup.phase == "login" then
-        rec.loadMs, rec.loadKind = max(0, now - startup.mark), "login"
+        -- Frames drawn since the mark belong to the loading screen, not to this addon.
+        rec.loadMs, rec.loadKind = max(0, now - (sameFrame and startup.mark or ns.frameStamp)), "login"
     else
-        -- Only the last frame boundary is known: what remains after an ordinary frame is the load.
-        rec.loadMs, rec.loadKind = max(0, now - ns.frameStamp - ns.frameMs), "demand"
+        -- After an earlier load in this frame the mark is exact; otherwise only the last frame
+        -- boundary is known, and what remains after an ordinary frame is the load.
+        local from = startup.mark > ns.frameStamp and startup.mark or ns.frameStamp + ns.frameMs
+        rec.loadMs, rec.loadKind = max(0, now - from), "demand"
         rec.loadAt = (now - T0) / 1000
+        rec.baseAfter = ns.frameCount + 2
+        ns.loadedThisFrame = true
     end
+    NoteCarrier(rec)
     if name == ADDON then
         LoadDatabase()
         ns.Roster()
@@ -239,8 +304,7 @@ local function OnAddonLoaded(name)
     elseif startup.phase == "session" and not rec.blizzard and rec.index == nil then
         ns.Roster()
     end
-    startup.mark = Clock()
-    startup.heapMark = collectgarbage("count")
+    Mark()
 end
 
 local function History(name)
@@ -252,17 +316,25 @@ local function History(name)
     return runs
 end
 
-local function FinishStartup(now)
+local function FinishStartup(now, timedOut)
+    local t = startup.t
     startup.done, startup.phase = true, "session"
-    startup.t.ready = max(startup.t.screen or now, startup.t.world or now)
-    ns.loading = false
+    startup.timedOut = timedOut or nil
+    if timedOut then
+        -- The client never said the screen lifted: it may still be up.
+        t.ready = t.firstFrame or now
+        ns.loading, ns.loadingSince = true, now
+    else
+        t.ready = max(t.screen, t.world or t.screen)
+        ns.loading = false
+    end
     ns.quietUntil = now + QUIET_AFTER_LOADING_MS
     ns.trackedSince = now
     ns.Roster()
 
-    local addonMs, blizzardMs, counted, slowest = 0, 0, 0, nil
+    local addonMs, blizzardMs, counted, estimated, slowest = 0, 0, 0, 0, nil
     for _, rec in ipairs(ns.list) do
-        if rec.loadKind == "startup" or rec.loadKind == "login" then
+        if rec.loadKind == "startup" then
             if rec.blizzard then
                 blizzardMs = blizzardMs + rec.loadMs
             elseif rec.installed then
@@ -271,7 +343,7 @@ local function FinishStartup(now)
                 if not slowest or rec.loadMs > slowest.loadMs then
                     slowest = rec
                 end
-                if db and rec.loadKind == "startup" then
+                if db then
                     local runs = History(rec.name)
                     runs[#runs + 1] = floor(rec.loadMs * 10 + 0.5) / 10
                     while #runs > ns.HISTORY_KEEP do
@@ -279,10 +351,13 @@ local function FinishStartup(now)
                     end
                 end
             end
+        elseif rec.loadKind == "login" and rec.installed and not rec.blizzard then
+            estimated = estimated + 1
         end
     end
     startup.addonMs, startup.blizzardMs, startup.counted, startup.slowest = addonMs, blizzardMs, counted, slowest
-    startup.totalMs = startup.t.ready - T0
+    startup.estimated = estimated
+    startup.totalMs = t.ready - T0
     if db then
         for name in pairs(db.history) do
             local rec = ns.addons[name]
@@ -291,15 +366,16 @@ local function FinishStartup(now)
             end
         end
         local logins = db.logins
-        logins[#logins + 1] = {
+        startup.login = {
             at = time(), reload = startup.reload and true or false,
             addonMs = floor(addonMs + 0.5), totalMs = floor(startup.totalMs + 0.5), addons = counted,
         }
+        logins[#logins + 1] = startup.login
         while #logins > ns.HISTORY_KEEP do
             table.remove(logins, 1)
         end
     end
-    ns.Baseline(true)
+    ns.settle = "startup"
     ns.memory.next = FIRST_MEMORY_DELAY
     if db and db.loginLine and slowest then
         ns.Say(("%d addons loaded in %s; slowest %s (%s). /weight"):format(
@@ -319,10 +395,35 @@ function ns.LoadAverage(rec)
     return total / #runs, #runs
 end
 
+-- The load time to judge by: the middle one of the saved runs once there are three, so one cold
+-- login does not decide it. Estimates are not judged.
+function ns.LoadTypical(rec)
+    if rec.loadKind ~= "startup" then
+        return nil
+    end
+    local runs = db and db.history[rec.name]
+    if not runs or #runs < 3 then
+        return rec.loadMs
+    end
+    local sorted = {}
+    for i, ms in ipairs(runs) do
+        sorted[i] = ms
+    end
+    table.sort(sorted)
+    return sorted[floor((#sorted + 1) / 2)]
+end
+
 -- Processor time ---------------------------------------------------------------------------
 
 local profiler = C_AddOnProfiler
 local Metric = Enum and Enum.AddOnProfilerMetric
+
+local function ClearFigures()
+    for _, rec in ipairs(ns.list) do
+        rec.recent = nil
+    end
+    ns.cpu.overall, ns.cpu.application = nil, nil
+end
 
 function ns.ProfilerEnabled()
     if ns.cpu.failed or not (profiler and Metric and profiler.GetAddOnMetric) then
@@ -345,64 +446,127 @@ local function Profiled(rec)
     return rec.cpuOk
 end
 
--- Spike counters and the peak are counted from here on: what loading added to them is set aside.
-function ns.Baseline(atStartup)
+local function Guarded(fn, ...)
     if not ns.ProfilerEnabled() then
-        return
+        return false
     end
-    local ok = pcall(function()
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        ns.cpu.failed, ns.cpu.error = true, tostring(err)
+        ClearFigures()
+    end
+    return ok
+end
+
+local function SetBase(rec, peak)
+    ReadBuckets(rec, rec.base)
+    rec.peakBase, rec.peakSeen, rec.based = peak, nil, true
+end
+
+-- Spike counts and the peak are counted from here on: what loading added to them is set aside.
+function ns.Baseline(atStartup)
+    return Guarded(function()
         for _, rec in ipairs(ns.list) do
             if Tracked(rec) and Profiled(rec) then
-                ReadBuckets(rec, rec.base)
-                rec.peakBase = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
+                SetBase(rec, profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0)
                 if atStartup then
                     rec.loadPeak = rec.peakBase
                 end
             end
         end
     end)
-    if not ok then
-        ns.cpu.failed = true
-    end
 end
 
-local function SampleCPU(full)
+-- A loading screen in the session: what the counters gain behind it is no stutter anyone saw.
+local function Hold()
+    ns.holding = Guarded(function()
+        for _, rec in ipairs(ns.list) do
+            if Tracked(rec) and Profiled(rec) and rec.based then
+                rec.hold = rec.hold or {}
+                ReadBuckets(rec, rec.hold)
+                rec.holdPeak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
+            end
+        end
+    end)
+end
+
+local function Release()
+    ns.holding = nil
+    Guarded(function()
+        for _, rec in ipairs(ns.list) do
+            local hold = rec.hold
+            if hold and hold[1] and rec.based and Tracked(rec) then
+                for i, key in ipairs(BUCKET_METRICS) do
+                    local count = profiler.GetAddOnMetric(rec.name, Metric[key]) or 0
+                    rec.base[i] = (rec.base[i] or 0) + max(0, count - hold[i])
+                end
+                local peak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
+                if peak > (rec.holdPeak or 0) then
+                    rec.peakBase = peak
+                end
+                hold[1] = nil
+            end
+        end
+    end)
+end
+
+local function Settle()
+    if ns.settle == "startup" then
+        ns.holding = nil
+        ns.Baseline(true)
+    else
+        Release()
+    end
+    ns.settle = nil
+end
+
+-- `full` also reads the figures only the window and the report show; `displayOnly` reads without
+-- adding to the averages, which count one sample per 60 frames and nothing else.
+local function SampleCPU(full, displayOnly)
     local cpu = ns.cpu
     local combat = InCombatLockdown() and true or false
+    local behindScreen = ns.loading or ns.holding or ns.settle
     for _, rec in ipairs(ns.list) do
         if Tracked(rec) and Profiled(rec) then
-            local recent = profiler.GetAddOnMetric(rec.name, Metric.RecentAverageTime) or 0
-            rec.recent = recent
-            rec.sum, rec.n = rec.sum + recent, rec.n + 1
-            if combat then
-                rec.combatSum, rec.combatN = rec.combatSum + recent, rec.combatN + 1
+            local peak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
+            if not rec.based and (rec.baseAfter or 0) <= ns.frameCount then
+                SetBase(rec, peak)
             end
-            if full then
-                rec.session = profiler.GetAddOnMetric(rec.name, Metric.SessionAverageTime) or 0
-                rec.peak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
-                rec.encounter = profiler.GetAddOnMetric(rec.name, Metric.EncounterAverageTime) or 0
-                ReadBuckets(rec, rec.over)
+            if rec.based then
+                local recent = profiler.GetAddOnMetric(rec.name, Metric.RecentAverageTime) or 0
+                rec.recent = recent
+                if not displayOnly then
+                    rec.sum, rec.n = rec.sum + recent, rec.n + 1
+                    if combat then
+                        rec.combatSum, rec.combatN = rec.combatSum + recent, rec.combatN + 1
+                    end
+                end
+                rec.peak = peak
+                if not behindScreen and peak > rec.peakBase and peak > (rec.peakSeen or 0) then
+                    rec.peakSeen = peak
+                end
+                if full then
+                    rec.session = profiler.GetAddOnMetric(rec.name, Metric.SessionAverageTime) or 0
+                    rec.encounter = profiler.GetAddOnMetric(rec.name, Metric.EncounterAverageTime) or 0
+                    ReadBuckets(rec, rec.over)
+                end
             end
         end
     end
     cpu.overall = profiler.GetOverallMetric(Metric.RecentAverageTime) or 0
     cpu.application = profiler.GetApplicationMetric(Metric.RecentAverageTime) or 0
-    cpu.samples = cpu.samples + 1
-    cpu.sum = (cpu.sum or 0) + cpu.overall
-    if combat then
-        cpu.combatSum, cpu.combatN = (cpu.combatSum or 0) + cpu.overall, (cpu.combatN or 0) + 1
+    if not displayOnly then
+        cpu.samples = cpu.samples + 1
+        cpu.sum = (cpu.sum or 0) + cpu.overall
     end
 end
 
-function ns.SampleCPU(full)
+function ns.SampleCPU(full, displayOnly)
     if not ns.ProfilerEnabled() then
+        ClearFigures()
         return false
     end
-    local ok, err = pcall(SampleCPU, full)
-    if not ok then
-        ns.cpu.failed, ns.cpu.error = true, tostring(err)
-    end
-    return ok
+    return Guarded(SampleCPU, full, displayOnly)
 end
 
 function ns.Average(rec)
@@ -421,15 +585,73 @@ function ns.Over(rec, bucket)
     return max(0, now - (rec.base[bucket] or 0))
 end
 
--- The profiler's peak covers loading too; a peak no higher than the one set aside is not news.
+-- The worst frame since tracking began, loading left out: the exact figure when the client's
+-- peak rose in that time, else the highest mark a counter passed ("over 100 ms").
 function ns.Peak(rec)
-    if not rec.peak then
+    local band
+    for i = #ns.BUCKETS, SPIKE_BUCKET, -1 do
+        local count = ns.Over(rec, i)
+        if count and count > 0 then
+            band = ns.BUCKETS[i]
+            break
+        end
+    end
+    local exact = rec.peakSeen
+    if exact and (not band or exact >= band) then
+        return exact, nil
+    end
+    return nil, band
+end
+
+function ns.FormatPeak(rec)
+    local exact, band = ns.Peak(rec)
+    if exact then
+        return ns.FormatMs(exact), exact
+    elseif band then
+        return (">%d"):format(band), band
+    end
+    return "-", nil
+end
+
+function ns.TrackedSeconds()
+    return max(0, (Clock() - ns.trackedSince) / 1000)
+end
+
+-- Frames the addon alone ran over 50 ms, and how many that is an hour (never over less than a
+-- minute, so the first one is not a rate of thousands).
+function ns.SpikeRate(rec)
+    local count = ns.Over(rec, SPIKE_BUCKET)
+    if not count then
         return nil
     end
-    if rec.peakBase and rec.peak <= rec.peakBase then
-        return nil, rec.peak
+    return count / max(ns.TrackedSeconds() / 3600, 1 / 60), count
+end
+
+function ns.SpikeLevel(rec)
+    local rate, count = ns.SpikeRate(rec)
+    if not rate or count == 0 then
+        return 0, 0
     end
-    return rec.peak
+    local marks = ns.SPIKES
+    if count >= marks.heavy[1] and rate >= marks.heavy[2] then
+        return 2, 1 + min(1, rate / (marks.heavy[2] * 10))
+    elseif count >= marks.noticeable[1] and rate >= marks.noticeable[2] then
+        return 1, 0.5 + 0.49 * min(1, (rate - marks.noticeable[2]) / (marks.heavy[2] - marks.noticeable[2]))
+    end
+    return 0, min(0.4, 0.2 * count)
+end
+
+-- The addon's share of the game's frame work, as Blizzard's AddOn list counts it.
+function ns.Share(rec)
+    local cpu = ns.cpu
+    if not (rec.recent and cpu.application and cpu.overall) then
+        return nil
+    end
+    local total = cpu.application - cpu.overall + rec.recent
+    if total <= 0 then
+        return nil
+    end
+    return rec.recent / total
 end
 
 -- Memory -----------------------------------------------------------------------------------
@@ -441,6 +663,7 @@ function ns.SampleMemory()
     local now = Clock()
     memory.cost = now - started
     memory.slow = memory.cost >= MEMORY_SLOW_MS
+    ns.skipFrame = true
     local seconds = memory.at and (now - memory.at) / 1000 or nil
     local total, growth = 0, 0
     for _, rec in ipairs(ns.list) do
@@ -449,17 +672,19 @@ function ns.SampleMemory()
         end
         if Tracked(rec) and rec.memOk then
             local kb = GetAddOnMemoryUsage(rec.name) or 0
-            if rec.mem and seconds and seconds > 0 then
+            if rec.mem and seconds and seconds >= 1 then
                 -- A fall means the collector ran in between: that interval says nothing about the rate.
                 local delta = kb - rec.mem
                 if delta >= 0 then
                     local rate = delta / seconds
-                    rec.alloc = rec.alloc + delta
-                    rec.growth = rec.growth and (rec.growth * 0.6 + rate * 0.4) or rate
+                    local keep = exp(-seconds / GROWTH_MEMORY_SECONDS)
+                    rec.growth = rec.growth and (rec.growth * keep + rate * (1 - keep)) or rate
                 end
-                growth = growth + (rec.growth or 0)
             end
-            if not rec.memFirst then
+            growth = growth + (rec.growth or 0)
+            -- Growth is measured against a reading taken once the addon has settled in.
+            rec.memSeenAt = rec.memSeenAt or now
+            if not rec.memFirst and now - rec.memSeenAt >= MEMORY_SETTLE_MS then
                 rec.memFirst, rec.memFirstAt = kb, now
             end
             rec.mem = kb
@@ -472,7 +697,7 @@ function ns.SampleMemory()
     memory.scans = memory.scans + 1
 end
 
--- Net growth since the first reading, once it is both large and most of what the addon holds.
+-- Net growth since the settled reading, once it is both large and most of what the addon held.
 function ns.Leak(rec)
     if not (rec.mem and rec.memFirst) then
         return nil
@@ -489,6 +714,16 @@ end
 
 local pending
 
+local function ClearStutters()
+    pending = nil
+    for key in pairs(ns.stutters) do
+        ns.stutters[key] = nil
+    end
+    for _, rec in ipairs(ns.list) do
+        rec.stutters = 0
+    end
+end
+
 local function ReadBlame()
     local top = profiler.GetTopKAddOnsForMetric(Metric.LastTime, 3)
     local overall = profiler.GetOverallMetric(Metric.LastTime) or 0
@@ -499,6 +734,8 @@ local function ReadBlame()
     return nil, 0, overall
 end
 
+-- One reading of what addons took in the client's last frame. A figure longer than the stutter
+-- itself describes another frame and is left out; the addon and the total come from one reading.
 local function Blame(stutter)
     if not ns.ProfilerEnabled() then
         return
@@ -507,17 +744,23 @@ local function Blame(stutter)
     if not ok then
         return
     end
-    if ms > (stutter.addonMs or -1) then
-        stutter.name, stutter.addonMs, stutter.reading = name, ms, stutter.readings + 1
-    end
-    stutter.overallMs = max(stutter.overallMs or 0, overall)
     stutter.readings = stutter.readings + 1
+    local limit = stutter.ms * BLAME_SLACK
+    if name and ms > 0 and ms <= limit and ms > (stutter.addonMs or 0) then
+        stutter.name, stutter.addonMs = name, min(ms, stutter.ms)
+        stutter.overallMs = min(max(overall, ms), stutter.ms)
+        stutter.reading = stutter.readings
+    elseif not stutter.name and overall <= limit and overall > (stutter.overallMs or 0) then
+        stutter.overallMs = min(overall, stutter.ms)
+    end
 end
 
-local function FinishStutter()
+local function FinishStutter(readAgain)
     local stutter = pending
     pending = nil
-    Blame(stutter)
+    if readAgain then
+        Blame(stutter)
+    end
     local half = stutter.ms * 0.5
     if stutter.readings == 0 then
         stutter.cause = "unknown"
@@ -528,15 +771,15 @@ local function FinishStutter()
             rec.stutters = rec.stutters + 1
             stutter.title = rec.title
         end
+        if stutter.reading == 1 then
+            ns.blame.first = ns.blame.first + 1
+        else
+            ns.blame.second = ns.blame.second + 1
+        end
     elseif (stutter.overallMs or 0) >= half then
         stutter.cause, stutter.name = "addons", nil
     else
         stutter.cause, stutter.name = "game", nil
-    end
-    if stutter.reading == 1 then
-        ns.blame.first = ns.blame.first + 1
-    elseif stutter.reading == 2 then
-        ns.blame.second = ns.blame.second + 1
     end
     stutter.readings, stutter.reading = nil, nil
     local list = ns.stutters
@@ -558,7 +801,7 @@ function ns.DescribeStutter(stutter)
     elseif stutter.cause == "addons" then
         what = ("addons together took %s ms of it"):format(ns.FormatMs(stutter.overallMs))
     elseif stutter.cause == "game" then
-        what = ("not from addons (they took %s ms)"):format(ns.FormatMs(stutter.overallMs or 0))
+        what = ("not charged to any addon (they took %s ms)"):format(ns.FormatMs(stutter.overallMs or 0))
     else
         what = "cause unknown, the client's addon profiler is off"
     end
@@ -568,43 +811,106 @@ end
 
 -- Frames -----------------------------------------------------------------------------------
 
-local cpuWait, memoryWait = 0, 0
+local sampleFrames, memoryWait = 0, 0
+local heapLast
+
+local function ScannedLately(now)
+    return ns.memory.at ~= nil and now - ns.memory.at < MEMORY_INTERVAL_SHOWN * 1000
+end
+
+-- The fallback clock can be restarted by another addon: every kept time moves back with it.
+local function Reanchor(now)
+    local jump = now - ns.frameStamp
+    ns.quietUntil = ns.quietUntil + jump
+    ns.trackedSince = ns.trackedSince + jump
+    ns.loadingSince = ns.loadingSince + jump
+    startup.mark = startup.mark + jump
+    local memory = ns.memory
+    if memory.at then
+        memory.at = memory.at + jump
+    end
+    for _, rec in ipairs(ns.list) do
+        if rec.memSeenAt then
+            rec.memSeenAt = rec.memSeenAt + jump
+        end
+        if rec.memFirstAt then
+            rec.memFirstAt = rec.memFirstAt + jump
+        end
+    end
+end
 
 local function OnUpdate(_, elapsed)
     local now = Clock()
+    if now < ns.frameStamp then
+        Reanchor(now)
+    end
     if not startup.done then
-        if startup.sawWorld and (startup.t.screen or now - startup.t.world >= STARTUP_TIMEOUT_MS) then
-            FinishStartup(now)
-            ns.frameStamp = now
+        startup.frames = startup.frames + 1
+        if startup.sawWorld then
+            startup.t.firstFrame = startup.t.firstFrame or now
+            if startup.t.screen then
+                FinishStartup(now, false)
+            elseif now - startup.t.world >= STARTUP_TIMEOUT_MS then
+                FinishStartup(now, true)
+            end
         end
+        ns.frameStamp = Clock()
         return
     end
-    if pending then
-        FinishStutter()
+    ns.frameCount = ns.frameCount + 1
+    if ns.loading and now - ns.loadingSince >= LOADING_LIMIT_MS then
+        ns.loading = false
+        ns.quietUntil = now + QUIET_AFTER_LOADING_MS
     end
+    local quiet = ns.loading or now < ns.quietUntil
+    if ns.settle and not quiet then
+        Settle()
+    end
+    if ns.stutterMark ~= db.stutterMs then
+        ClearStutters()
+        ns.stutterMark = db.stutterMs
+    end
+
     local ms = elapsed * 1000
-    if db.stutter and ms >= db.stutterMs and elapsed < PAUSED_FRAME_SECONDS and not ns.loading and now >= ns.quietUntil then
-        pending = { at = time(), ms = ms, combat = InCombatLockdown() and true or false, readings = 0 }
-        Blame(pending)
-    elseif elapsed < PAUSED_FRAME_SECONDS then
-        ns.frameMs = ns.frameMs > 0 and ns.frameMs * 0.95 + ms * 0.05 or ms
+    local long = ms >= db.stutterMs
+    local skip = ns.skipFrame
+    ns.skipFrame = nil
+    if pending then
+        -- The next frame's reading can still hold the stutter's work, unless that frame has its own.
+        FinishStutter(not long and not ns.loading and not ns.loadedThisFrame)
     end
-    ns.frameStamp = now
+    ns.loadedThisFrame = nil
+    if not quiet and not skip and elapsed < PAUSED_FRAME_SECONDS then
+        if not long then
+            ns.frameMs = ns.frameMs > 0 and ns.frameMs * 0.95 + ms * 0.05 or ms
+        elseif db.stutter then
+            pending = { at = time(), ms = ms, combat = InCombatLockdown() and true or false, readings = 0 }
+            Blame(pending)
+        end
+    end
+
+    local heap = collectgarbage("count")
+    if heapLast and heap > heapLast then
+        ns.heap.rise = ns.heap.rise + heap - heapLast
+    end
+    heapLast = heap
 
     local shown = ns.watching
-    if shown or db.background then
-        cpuWait = cpuWait + elapsed
-        if cpuWait >= (shown and CPU_INTERVAL_SHOWN or CPU_INTERVAL_HIDDEN) then
-            cpuWait = 0
+    if quiet then
+        sampleFrames = 0
+    elseif shown or db.background then
+        sampleFrames = sampleFrames + 1
+        if sampleFrames >= SAMPLE_FRAMES then
+            sampleFrames = 0
             ns.SampleCPU(shown)
         end
     end
     local memory = ns.memory
     if memory.next then
         memory.next = memory.next - elapsed
-        if memory.next <= 0 then
+        if memory.next <= 0 and not InCombatLockdown() then
             memory.next = nil
-            if shown or db.memory then
+            if (shown or db.memory) and not ScannedLately(now) then
                 memoryWait = 0
                 ns.SampleMemory()
             end
@@ -612,7 +918,7 @@ local function OnUpdate(_, elapsed)
     elseif shown or db.memory then
         memoryWait = memoryWait + elapsed
         local interval = shown and (memory.slow and MEMORY_INTERVAL_SLOW or MEMORY_INTERVAL_SHOWN) or MEMORY_INTERVAL_HIDDEN
-        if memoryWait >= interval and (shown or not InCombatLockdown()) then
+        if memoryWait >= interval and not InCombatLockdown() then
             memoryWait = 0
             ns.SampleMemory()
         end
@@ -620,15 +926,15 @@ local function OnUpdate(_, elapsed)
     if shown and ns.Refresh then
         ns.Refresh(elapsed)
     end
+    ns.frameStamp = Clock()
 end
 ns.OnUpdate = OnUpdate
 
 function ns.Watch(shown)
     ns.watching = shown and true or false
     if shown and startup.done then
-        cpuWait = 0
-        ns.SampleCPU(true)
-        if not ns.memory.at or Clock() - ns.memory.at >= MEMORY_INTERVAL_SHOWN * 1000 then
+        ns.SampleCPU(true, true)
+        if not InCombatLockdown() and not ScannedLately(Clock()) then
             memoryWait = 0
             ns.SampleMemory()
         end
@@ -639,19 +945,21 @@ function ns.Reset()
     local now = Clock()
     for _, rec in ipairs(ns.list) do
         rec.sum, rec.n, rec.combatSum, rec.combatN = 0, 0, 0, 0
-        rec.alloc, rec.stutters = 0, 0
         rec.memFirst, rec.memFirstAt = rec.mem, rec.mem and now or nil
         rec.memPeak = rec.mem
     end
     local cpu = ns.cpu
-    cpu.samples, cpu.sum, cpu.combatSum, cpu.combatN = 0, nil, nil, nil
-    for key in pairs(ns.stutters) do
-        ns.stutters[key] = nil
-    end
+    cpu.samples, cpu.sum = 0, nil
+    ClearStutters()
+    ns.heap.rise = 0
     ns.trackedSince = now
-    ns.Baseline(false)
-    if startup.done then
-        ns.SampleCPU(true)
+    sampleFrames = 0
+    if startup.done and ns.settle ~= "startup" then
+        ns.Baseline(false)
+        if ns.holding then
+            Hold()
+        end
+        ns.SampleCPU(true, true)
     end
 end
 
@@ -668,63 +976,137 @@ local function Norm(value, limit)
     return 0.5 + 0.5 * (value - noticeable) / (heavy - noticeable)
 end
 
+local function LevelOf(score)
+    return score >= 1 and 2 or score >= 0.5 and 1 or 0
+end
+
+function ns.Level(value, limit)
+    return LevelOf(Norm(value, limit))
+end
+
+-- The frame time to judge by: the average, or the combat average once there is enough of it.
+function ns.JudgedTime(rec)
+    local average = ns.Average(rec) or rec.recent or 0
+    if rec.combatN >= COMBAT_MIN_SAMPLES then
+        local combat = rec.combatSum / rec.combatN
+        if combat > average then
+            return combat, true
+        end
+    end
+    return average, false
+end
+
+local FRAME_PARTS = { "cpu", "spike", "growth" }
+local OTHER_PARTS = { "memory", "load", "leak" }
+local KIND = { memory = "memory", leak = "memory", load = "loading" }
+
+-- An addon is as heavy as its worst measure. Measures that cost frames (time, spikes, garbage)
+-- rank above those that cost memory or loading time at the same level.
 function ns.Judge(rec)
     local limits = ns.LIMITS
     local parts = rec.parts or {}
     rec.parts = parts
-    parts.cpu = Norm(max(ns.Average(rec) or rec.recent or 0, ns.CombatAverage(rec) or 0), limits.cpu)
-    parts.spike = Norm(ns.Over(rec, SPIKE_BUCKET), limits.spike)
-    parts.memory = Norm(rec.mem, limits.memory)
+    parts.cpu = Norm((ns.JudgedTime(rec)), limits.cpu)
+    local _, spike = ns.SpikeLevel(rec)
+    parts.spike = spike
     parts.growth = Norm(rec.growth, limits.growth)
-    parts.load = rec.loadKind ~= "before" and Norm(rec.loadMs, limits.load) or 0
-    parts.login = Norm(rec.loadPeak, limits.login)
-    local score, worst = 0, nil
-    for key, value in pairs(parts) do
-        if value > score then
-            score, worst = value, key
+    parts.memory = Norm(rec.mem, limits.memory)
+    parts.load = max(Norm(ns.LoadTypical(rec), limits.load), Norm(rec.loadPeak, limits.burst))
+    parts.leak = ns.Leak(rec) and 0.5 or 0
+    local frames, other, worst = 0, 0, nil
+    for _, key in ipairs(FRAME_PARTS) do
+        frames = max(frames, parts[key])
+    end
+    for _, key in ipairs(OTHER_PARTS) do
+        if parts[key] > other then
+            other, worst = parts[key], key
         end
     end
-    if ns.Leak(rec) then
-        score = max(score, 1)
-        worst = worst or "memory"
+    local score = max(frames, other)
+    rec.score, rec.level = score, LevelOf(score)
+    if rec.level == 0 then
+        rec.kind = nil
+    elseif LevelOf(frames) == rec.level then
+        rec.kind = "frames"
+    else
+        rec.kind = KIND[worst]
     end
-    rec.score, rec.worst = score, worst
-    rec.level = score >= 1 and 2 or score >= 0.5 and 1 or 0
+    rec.rank = rec.level * 100 + (rec.kind == "frames" and 50 or 0) + min(score, 4) * 10
     return rec.level
-end
-
-function ns.Level(value, limit)
-    local score = Norm(value, limit)
-    return score >= 1 and 2 or score >= 0.5 and 1 or 0
 end
 
 local REASONS = {
     cpu = function(rec)
-        local combat = ns.CombatAverage(rec)
-        local average = ns.Average(rec) or rec.recent or 0
-        if combat and combat > average then
-            return ("%s ms of every frame in combat"):format(ns.FormatMs(combat))
-        end
-        return ("%s ms of every frame"):format(ns.FormatMs(average))
+        local ms, combat = ns.JudgedTime(rec)
+        return ("%s ms of every frame%s"):format(ns.FormatMs(ms), combat and " in combat" or "")
     end,
     spike = function(rec)
-        local count = ns.Over(rec, SPIKE_BUCKET)
-        return ("held %d frame%s for over 50 ms"):format(count, count == 1 and "" or "s")
+        local rate, count = ns.SpikeRate(rec)
+        return ("ran over 50 ms in %d frames (%d an hour)"):format(count, rate + 0.5)
+    end,
+    growth = function(rec)
+        return ("makes at least %s of new memory"):format(ns.FormatRate(rec.growth))
     end,
     memory = function(rec)
         return ("holds %s"):format(ns.FormatMemory(rec.mem))
     end,
-    growth = function(rec)
-        return ("makes %s of garbage"):format(ns.FormatRate(rec.growth))
-    end,
     load = function(rec)
-        return ("%s to load"):format(ns.FormatDuration(rec.loadMs))
+        local limits = ns.LIMITS
+        local typical = ns.LoadTypical(rec)
+        if Norm(typical, limits.load) >= Norm(rec.loadPeak, limits.burst) then
+            return ("%s to load"):format(ns.FormatDuration(typical))
+        end
+        return ("ran %s in one go while loading"):format(ns.FormatDuration(rec.loadPeak))
     end,
-    login = function(rec)
-        return ("held the loading screen for %s in one go"):format(ns.FormatDuration(rec.loadPeak))
+    leak = function(rec)
+        local grown, seconds = ns.Leak(rec)
+        return ("holds %s more than %s ago (addons that cache data do this too)"):format(ns.FormatMemory(grown), ns.FormatClock(seconds))
     end,
 }
-local REASON_ORDER = { "cpu", "spike", "memory", "growth", "load", "login" }
+local REASON_ORDER = { "cpu", "spike", "growth", "memory", "load", "leak" }
+
+local SHORT = {
+    cpu = function(rec)
+        local ms, combat = ns.JudgedTime(rec)
+        return ("%s ms %s"):format(ns.FormatMs(ms), combat and "in combat" or "a frame")
+    end,
+    spike = function(rec)
+        local _, count = ns.SpikeRate(rec)
+        return ("%d hitches"):format(count)
+    end,
+    growth = function(rec)
+        return ("%s new memory"):format(ns.FormatRate(rec.growth))
+    end,
+    memory = function(rec)
+        return ("%s held"):format(ns.FormatMemory(rec.mem))
+    end,
+    load = function(rec)
+        local limits = ns.LIMITS
+        local typical = ns.LoadTypical(rec)
+        if Norm(typical, limits.load) >= Norm(rec.loadPeak, limits.burst) then
+            return ("%s to load"):format(ns.FormatDuration(typical))
+        end
+        return ("%s burst at login"):format(ns.FormatDuration(rec.loadPeak))
+    end,
+    leak = function(rec)
+        return ("kept %s it grew"):format(ns.FormatMemory((ns.Leak(rec))))
+    end,
+}
+
+-- The measure furthest past its mark in a few words, and its level; nil for a light addon.
+function ns.ShortReason(rec)
+    ns.Judge(rec)
+    local worst, score = nil, 0.5
+    for _, key in ipairs(REASON_ORDER) do
+        if rec.parts[key] >= score and (not worst or rec.parts[key] > score) then
+            worst, score = key, rec.parts[key]
+        end
+    end
+    if not worst then
+        return nil, 0
+    end
+    return SHORT[worst](rec), LevelOf(score)
+end
 
 -- The measures at or over "noticeable", worst first, in words.
 function ns.Reasons(rec)
@@ -742,22 +1124,23 @@ function ns.Reasons(rec)
     for i, key in ipairs(keys) do
         out[i] = REASONS[key](rec)
     end
-    local grown, seconds = ns.Leak(rec)
-    if grown then
-        out[#out + 1] = ("grew %s in %s and has not given it back"):format(ns.FormatMemory(grown), ns.FormatClock(seconds))
-    end
     return out
 end
 
 -- Rows and totals --------------------------------------------------------------------------
 
+local function PeakValue(rec)
+    local exact, band = ns.Peak(rec)
+    return exact or band or -1
+end
+
 local SORTS = {
     name = function(rec) return rec.title:lower() end,
-    weight = function(rec) return rec.score or 0 end,
+    weight = function(rec) return rec.rank or 0 end,
     now = function(rec) return rec.recent or -1 end,
     average = function(rec) return ns.Average(rec) or -1 end,
     combat = function(rec) return ns.CombatAverage(rec) or -1 end,
-    peak = function(rec) return ns.Peak(rec) or -1 end,
+    peak = PeakValue,
     spikes = function(rec) return ns.Over(rec, SPIKE_BUCKET) or -1 end,
     memory = function(rec) return rec.mem or -1 end,
     growth = function(rec) return rec.growth or -1 end,
@@ -792,18 +1175,23 @@ end
 
 function ns.Summary()
     local cpu, memory = ns.cpu, ns.memory
+    local tracked = ns.TrackedSeconds()
     local summary = {
         fps = GetFramerate(),
         overall = cpu.overall, application = cpu.application,
         memory = memory.total, heap = memory.heap, growth = memory.growth,
         addonMs = startup.addonMs, blizzardMs = startup.blizzardMs, totalMs = startup.totalMs,
-        counted = startup.counted, reload = startup.reload,
-        tracked = (Clock() - ns.trackedSince) / 1000,
+        counted = startup.counted, estimated = startup.estimated, reload = startup.reload,
+        tracked = tracked,
         stutters = ns.stutters,
+        carrier = ns.carrier or nil,
         top = {},
     }
     if cpu.samples > 0 and cpu.sum then
         summary.overallAverage = cpu.sum / cpu.samples
+    end
+    if tracked >= 10 then
+        summary.heapRate = ns.heap.rise / tracked
     end
     if IsCpuBound then
         summary.cpuBound = IsCpuBound()
@@ -814,14 +1202,14 @@ function ns.Summary()
         if Tracked(rec) then
             loaded = loaded + 1
             if rec.name ~= ADDON then
-                local average = ns.Average(rec) or rec.recent or 0
-                if average > best.cpu then
-                    best.cpu, summary.top.cpu = average, rec
+                local judged = (ns.JudgedTime(rec))
+                if judged > best.cpu then
+                    best.cpu, summary.top.cpu = judged, rec
                 end
                 if (rec.mem or 0) > best.memory then
                     best.memory, summary.top.memory = rec.mem, rec
                 end
-                if rec.loadKind ~= "before" and (rec.loadMs or 0) > best.load then
+                if rec.loadKind == "startup" and rec.loadMs > best.load then
                     best.load, summary.top.load = rec.loadMs, rec
                 end
             end
@@ -832,10 +1220,9 @@ function ns.Summary()
     return summary
 end
 
--- What turning this addon off would be worth right now, in frames per second. Only a ceiling: a
+-- What an addon taking `ms` of every frame costs in frames per second. Only a ceiling: a
 -- frame rate held down by the graphics card or a frame cap does not rise.
-function ns.FpsCost(rec, fps)
-    local ms = rec.recent
+function ns.FpsCost(ms, fps)
     if not ms or ms <= 0 or not fps or fps <= 0 then
         return nil
     end
@@ -850,7 +1237,7 @@ end
 
 function ns.Report()
     if startup.done then
-        ns.SampleCPU(true)
+        ns.SampleCPU(true, true)
     end
     local summary = ns.Summary()
     local lines = {}
@@ -860,47 +1247,52 @@ function ns.Report()
     local version, build = GetBuildInfo()
     Add("%s %s, client %s.%s, %s", ns.TITLE, C_AddOns.GetAddOnMetadata(ADDON, "Version") or "?", tostring(version), tostring(build), date("%Y-%m-%d %H:%M"))
     Add("Tracking for %s. %d addons loaded.", ns.FormatClock(summary.tracked), summary.loaded)
-    if summary.application and summary.application > 0 then
-        Add("Frames: %.0f fps, %s ms per frame; addons take %s ms of it (%.0f%%)%s.", summary.fps, ns.FormatMs(summary.application),
+    if not ns.ProfilerEnabled() then
+        Add("Frames: %.0f fps. The client's addon profiler is off, so there are no processor figures.", summary.fps)
+    elseif summary.application and summary.application > 0 then
+        Add("Frames: %.0f fps, %s ms of work per frame; addons are charged %s ms of it (%.0f%%)%s.", summary.fps, ns.FormatMs(summary.application),
             ns.FormatMs(summary.overall), 100 * summary.overall / summary.application,
             summary.cpuBound == nil and "" or summary.cpuBound and "; the processor is the limit" or "; the graphics card is the limit")
-    elseif ns.ProfilerEnabled() then
-        Add("Frames: %.0f fps.", summary.fps)
     else
-        Add("Frames: %.0f fps. The client's addon profiler is off, so there are no processor figures.", summary.fps)
+        Add("Frames: %.0f fps.", summary.fps)
     end
     if summary.memory then
-        Add("Memory: addons hold %s (all of the interface's Lua: %s), growing %s.", ns.FormatMemory(summary.memory), ns.FormatMemory(summary.heap), ns.FormatRate(summary.growth))
+        Add("Memory: addons hold %s (all of the interface's Lua: %s).%s", ns.FormatMemory(summary.memory), ns.FormatMemory(summary.heap),
+            summary.heapRate and (" The whole interface makes about %s of garbage."):format(ns.FormatRate(summary.heapRate)) or "")
     end
     if summary.totalMs then
-        Add("Loading (%s): %d addons took %s; ready %s after the first addon began.", summary.reload and "reload" or "login", summary.counted or 0,
-            ns.FormatDuration(summary.addonMs), ns.FormatDuration(summary.totalMs))
+        Add("Loading (%s): %d addons took %s%s; ready %s after the first addon began.", summary.reload and "reload" or "login", summary.counted or 0,
+            ns.FormatDuration(summary.addonMs),
+            (summary.estimated or 0) > 0 and (", %d more loaded on demand"):format(summary.estimated) or "", ns.FormatDuration(summary.totalMs))
+    end
+    if summary.carrier then
+        Add("%s loaded Ace3 first: the profiler charges it with the event and setup work of every Ace3 addon.", summary.carrier.title)
     end
     Add("")
-    Add("%-28s %7s %7s %7s %7s %6s %9s %9s %8s  %s", "Addon", "now", "avg", "combat", "peak", ">50ms", "memory", "garbage", "load", "verdict")
+    Add("%s %7s %7s %7s %7s %6s %9s %9s %8s  %s", ns.Fit("Addon", 28), "now", "avg", "combat", "peak", ">50ms", "memory", "garbage", "load", "verdict")
     for _, rec in ipairs(ns.Rows("weight")) do
         local load = rec.loadKind ~= "before" and ns.FormatDuration(rec.loadMs) or "-"
         if rec.loadKind == "login" or rec.loadKind == "demand" then
             load = "~" .. load
         end
-        Add("%-28s %7s %7s %7s %7s %6s %9s %9s %8s  %s", rec.title:sub(1, 28), ns.FormatMs(rec.recent), ns.FormatMs(ns.Average(rec)),
-            ns.FormatMs(ns.CombatAverage(rec)), ns.FormatMs(ns.Peak(rec)), tostring(ns.Over(rec, SPIKE_BUCKET) or "-"),
+        Add("%s %7s %7s %7s %7s %6s %9s %9s %8s  %s", ns.Fit(rec.title, 28), ns.FormatMs(rec.recent), ns.FormatMs(ns.Average(rec)),
+            ns.FormatMs(ns.CombatAverage(rec)), (ns.FormatPeak(rec)), tostring(ns.Over(rec, SPIKE_BUCKET) or "-"),
             ns.FormatMemory(rec.mem), ns.FormatRate(rec.growth), load,
             rec.level == 2 and "HEAVY: " .. table.concat(ns.Reasons(rec), "; ") or rec.level == 1 and "noticeable: " .. table.concat(ns.Reasons(rec), "; ") or "light")
     end
     Add("")
-    Add("Times are ms per frame. now = the last 60 frames, avg = since tracking began, peak = worst single frame since loading.")
+    Add("Times are ms per frame as the client's profiler charges them. now = the last 60 frames, avg = since tracking began, peak = worst frame since then (loading screens left out).")
     local stutters = ns.stutters
     if (stutters.total or 0) > 0 then
         Add("")
-        Add("Frames over %d ms: %d (one addon %d, addons together %d, not addons %d, unknown %d). The last %d:", db.stutterMs, stutters.total,
+        Add("Frames over %d ms: %d (one addon %d, addons together %d, no addon %d, unknown %d). The last %d:", db.stutterMs, stutters.total,
             stutters.addon or 0, stutters.addons or 0, stutters.game or 0, stutters.unknown or 0, #stutters)
         for _, stutter in ipairs(stutters) do
             Add("  " .. ns.DescribeStutter(stutter))
         end
     elseif db.stutter then
         Add("")
-        Add("No frame over %d ms since tracking began.", db.stutterMs)
+        Add("No frame over %d ms on record.", db.stutterMs)
     end
     return lines
 end
@@ -913,9 +1305,15 @@ function ns.Status()
             ns.ProfilerEnabled() and "on" or cpu.failed and "failed: " .. tostring(cpu.error) or "off",
             GetTimePreciseSec and "GetTimePreciseSec" or "debugprofilestop", cpu.samples, memory.scans,
             ns.FormatMs(memory.cost), memory.slow and ", so scans are spaced out" or ""),
-        ("startup %s: %d loads timed; stutter blame read on the stutter's frame %d times, the frame after %d times"):format(
-            startup.done and "done" or startup.phase, startup.loads, ns.blame.first, ns.blame.second),
+        ("startup %s%s: %d loads timed, %d of them after a drawn frame; %d frames drawn while loading"):format(
+            startup.done and "done" or startup.phase, startup.timedOut and " (the client never said the loading screen lifted)" or "",
+            startup.loads, startup.split or 0, startup.frames),
+        ("stutters blamed on an addon from the reading on the stutter's own frame %d times, from the frame after %d times"):format(
+            ns.blame.first, ns.blame.second),
     }
+    if ns.carrier then
+        lines[#lines + 1] = ("Ace3 was loaded first by %s"):format(ns.carrier.title)
+    end
     if own and own.recent then
         lines[#lines + 1] = ("this meter itself: %s ms per frame now, %s on average, %s"):format(
             ns.FormatMs(own.recent), ns.FormatMs(ns.Average(own)), ns.FormatMemory(own.mem))
@@ -930,8 +1328,7 @@ local handlers = {}
 handlers.ADDON_LOADED = OnAddonLoaded
 
 function handlers.PLAYER_LOGIN()
-    local now = Clock()
-    startup.t.login = now
+    startup.t.login = Clock()
     if startup.phase == "files" then
         startup.phase = "login"
     end
@@ -939,28 +1336,46 @@ function handlers.PLAYER_LOGIN()
         LoadDatabase()
     end
     ns.Roster()
-    startup.mark = Clock()
+    Mark()
 end
 
 function handlers.PLAYER_ENTERING_WORLD(_, reloading)
     if not startup.done and not startup.sawWorld then
         startup.sawWorld, startup.reload = true, reloading and true or false
         startup.t.world = Clock()
-        startup.mark = startup.t.world
+        Mark()
     end
 end
 
 function handlers.LOADING_SCREEN_ENABLED()
-    ns.loading = true
+    if startup.done and not ns.loading then
+        ns.loading, ns.loadingSince = true, Clock()
+        if not ns.holding and ns.settle ~= "startup" then
+            Hold()
+        end
+        if ns.holding then
+            ns.settle = ns.settle or "screen"
+        end
+    end
 end
 
 function handlers.LOADING_SCREEN_DISABLED()
     local now = Clock()
-    if startup.done then
-        ns.loading = false
-        ns.quietUntil = now + QUIET_AFTER_LOADING_MS
-    else
+    if not startup.done then
         startup.t.screen = now
+        return
+    end
+    ns.loading = false
+    ns.quietUntil = now + QUIET_AFTER_LOADING_MS
+    if startup.timedOut then
+        -- The first word from the client that the login screen lifted: that was when the game was ready.
+        startup.timedOut = nil
+        startup.t.screen, startup.t.ready = now, now
+        startup.totalMs = now - T0
+        if startup.login then
+            startup.login.totalMs = floor(startup.totalMs + 0.5)
+        end
+        ns.trackedSince = now
     end
 end
 
