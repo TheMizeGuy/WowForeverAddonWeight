@@ -503,7 +503,7 @@ end
 function wow.Start(options)
     options = options or {}
     wow.Reset(options)
-    wow.Install({ name = ADDON, title = "Addon Weight", version = "1.1.1" })
+    wow.Install({ name = ADDON, title = "Addon Weight", version = "1.1.2" })
     for _, addon in ipairs(options.addons or {}) do
         wow.Install(addon)
         if addon.before then
