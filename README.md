@@ -110,13 +110,15 @@ after loading, is marked Noticeable (never Heavy for that alone: addons that cac
   timed.
 - **Memory includes garbage not yet cleaned up**, and held memory alone rarely costs frames.
   Measuring it stops the game for as long as the scan takes, and with many large addons that is
-  long enough to feel. So the meter times every scan and never scans in combat. A scan under 10 ms
-  repeats once a minute with the window closed and every 5 seconds with it open. A longer one only
-  runs where its pause is hidden or asked for: in the seconds after a loading screen, when you open
-  the window, and with the window open no more often than keeps it to a five-hundredth of the time
-  (a 100 ms scan every 50 seconds). `/weight status` and the Memory column's tooltip say what a scan
-  costs on your setup. The "new memory" rate is taken from rises between scans, so it is a floor.
-  The whole interface's rate in the report comes from the Lua heap itself, frame by frame.
+  long enough to feel (version 1.0.0 scanned on a timer and hitched for exactly that reason). So the
+  meter times every scan and never scans in combat. A scan under 10 ms repeats once a minute with
+  the window closed and every 5 seconds with it open. A longer one, or one whose cost is not known
+  yet, runs only while a loading screen is up and when you open the window (at most every 15
+  seconds), never on a timer: the same rule Blizzard's AddOn list follows. The Memory tile then says
+  how old its reading is; close and reopen the window for a fresh one. `/weight status` and the
+  Memory column's tooltip say what a scan costs on your setup. The "new memory" rate is taken from
+  rises between scans, so it is a floor. The whole interface's rate in the report comes from the Lua
+  heap itself, frame by frame.
 - **Stutters** are whole frames over the mark, loading screens and the three seconds after one left
   out. Blame comes from what the profiler says each addon took in that frame: one addon if it took at
   least half, addons together if they all did, otherwise no addon (the game itself, the graphics
@@ -166,7 +168,9 @@ The first rows settle things the source cannot: paste `/weight status` after doi
 | The loading screen's end is seen | `/weight status` after a `/reload` | no "(the client never said the loading screen lifted)"; the Loading tile's total near what you felt |
 | The profiler is on | `/weight status` | "profiler on" |
 | Which reading carries the blame | `/weight status` after a few stutters blamed on an addon | counts for "the stutter's own frame" and "the frame after" |
-| A memory scan's cost | `/weight status` | "last took N ms"; at 10 or more the meter only scans behind loading screens, on opening the window and now and then while it is open |
+| A memory scan's cost | `/weight status` | "last took N ms"; at 10 or more the meter only scans behind loading screens and on opening the window |
+| The scan alone | `/run local t=debugprofilestop() UpdateAddOnMemoryUsage() print(debugprofilestop()-t)` | the same figure, straight from the client |
+| Who the client charges for it | `/dump AddOnPerformance:AddOnHasPerformanceWarning("!!AddonWeight")` | false |
 | The meter does not hitch | play with the window closed, then open | no regular pause; the meter's own row stays near 0 hitches |
 | Figures survive | `/reload`, then the All time tab | the same addons with their averages; "2 sessions" in the line above the tiles |
 | The tabs draw right | `/weight`, click each tab | two tabs under the window, the selected one raised, not covering the buttons |
