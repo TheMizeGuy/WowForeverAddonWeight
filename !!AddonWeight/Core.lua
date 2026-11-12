@@ -85,6 +85,45 @@ ns.cpu = { samples = 0 }
 ns.heap = { rise = 0 }
 ns.blame = { first = 0, second = 0 }
 
+-- The fallback clock can be restarted by another addon: every kept time moves back with it.
+local lastClock = T0
+
+local function Reanchor(jump)
+    T0 = T0 + jump
+    for key, at in pairs(startup.t) do
+        startup.t[key] = at + jump
+    end
+    startup.mark = startup.mark + jump
+    ns.frameStamp = ns.frameStamp + jump
+    ns.quietUntil = ns.quietUntil + jump
+    ns.trackedSince = ns.trackedSince + jump
+    ns.loadingSince = ns.loadingSince + jump
+    local memory = ns.memory
+    if memory.at then
+        memory.at = memory.at + jump
+    end
+    for _, rec in ipairs(ns.list) do
+        if rec.memSeenAt then
+            rec.memSeenAt = rec.memSeenAt + jump
+        end
+        if rec.memFirstAt then
+            rec.memFirstAt = rec.memFirstAt + jump
+        end
+        if rec.baseAt then
+            rec.baseAt = rec.baseAt + jump
+        end
+    end
+end
+
+local function Now()
+    local now = Clock()
+    if now < lastClock then
+        Reanchor(now - lastClock)
+    end
+    lastClock = now
+    return now
+end
+
 local function Clean(text)
     if type(text) ~= "string" then
         return nil
@@ -253,7 +292,10 @@ local function NoteCarrier(rec)
     if ns.carrier ~= nil or not (_G.AceEvent30Frame or _G.AceAddon30Frame) then
         return
     end
-    if rec.name == ADDON or rec.blizzard then
+    if rec.blizzard then
+        -- A module of Blizzard's that one of Ace3's users asked for: that user's own load comes next.
+        return
+    elseif rec.name == ADDON then
         ns.carrier = false
     else
         ns.carrier, rec.carries = rec, "Ace3"
@@ -261,7 +303,7 @@ local function NoteCarrier(rec)
 end
 
 local function OnAddonLoaded(name)
-    local now = Clock()
+    local now = Now()
     local heap = collectgarbage("count")
     if type(name) ~= "string" then
         return
@@ -292,6 +334,10 @@ local function OnAddonLoaded(name)
         rec.loadMs, rec.loadKind = max(0, now - from), "demand"
         rec.loadAt = (now - T0) / 1000
         rec.baseAfter = ns.frameCount + 2
+        if not rec.blizzard then
+            ns.unbased = ns.unbased or {}
+            ns.unbased[#ns.unbased + 1] = rec
+        end
         ns.loadedThisFrame = true
     end
     NoteCarrier(rec)
@@ -319,7 +365,7 @@ end
 local function FinishStartup(now, timedOut)
     local t = startup.t
     startup.done, startup.phase = true, "session"
-    startup.timedOut = timedOut or nil
+    startup.timedOut, startup.unlifted = timedOut or nil, timedOut or nil
     if timedOut then
         -- The client never said the screen lifted: it may still be up.
         t.ready = t.firstFrame or now
@@ -420,7 +466,10 @@ local Metric = Enum and Enum.AddOnProfilerMetric
 
 local function ClearFigures()
     for _, rec in ipairs(ns.list) do
-        rec.recent = nil
+        rec.recent, rec.session = nil, nil
+        for i in ipairs(rec.over) do
+            rec.over[i] = nil
+        end
     end
     ns.cpu.overall, ns.cpu.application = nil, nil
 end
@@ -461,6 +510,7 @@ end
 local function SetBase(rec, peak)
     ReadBuckets(rec, rec.base)
     rec.peakBase, rec.peakSeen, rec.based = peak, nil, true
+    rec.baseAt = Clock()
 end
 
 -- Spike counts and the peak are counted from here on: what loading added to them is set aside.
@@ -510,6 +560,23 @@ local function Release()
     end)
 end
 
+-- Addons loaded on demand get their baseline two frames on, so their own loading frame is not a
+-- hitch, and never behind a loading screen.
+local function BasePending()
+    local left
+    for _, rec in ipairs(ns.unbased) do
+        if not rec.based and Tracked(rec) then
+            if rec.baseAfter <= ns.frameCount and Profiled(rec) then
+                SetBase(rec, profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0)
+            elseif rec.cpuOk ~= false then
+                left = left or {}
+                left[#left + 1] = rec
+            end
+        end
+    end
+    ns.unbased = left
+end
+
 local function Settle()
     if ns.settle == "startup" then
         ns.holding = nil
@@ -529,7 +596,7 @@ local function SampleCPU(full, displayOnly)
     for _, rec in ipairs(ns.list) do
         if Tracked(rec) and Profiled(rec) then
             local peak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
-            if not rec.based and (rec.baseAfter or 0) <= ns.frameCount then
+            if not rec.based and not behindScreen and (rec.baseAfter or 0) <= ns.frameCount then
                 SetBase(rec, peak)
             end
             if rec.based then
@@ -569,8 +636,15 @@ function ns.SampleCPU(full, displayOnly)
     return Guarded(SampleCPU, full, displayOnly)
 end
 
+-- Before the first sample the client's own average since login stands in; after a Reset that
+-- figure is about the wrong stretch of time.
 function ns.Average(rec)
-    return rec.n > 0 and rec.sum / rec.n or rec.session
+    if rec.n > 0 then
+        return rec.sum / rec.n
+    elseif ns.wasReset then
+        return rec.recent
+    end
+    return rec.session
 end
 
 function ns.CombatAverage(rec)
@@ -624,7 +698,8 @@ function ns.SpikeRate(rec)
     if not count then
         return nil
     end
-    return count / max(ns.TrackedSeconds() / 3600, 1 / 60), count
+    local since = max(ns.trackedSince, rec.baseAt or 0)
+    return count / max((Clock() - since) / 3600000, 1 / 60), count
 end
 
 function ns.SpikeLevel(rec)
@@ -734,8 +809,8 @@ local function ReadBlame()
     return nil, 0, overall
 end
 
--- One reading of what addons took in the client's last frame. A figure longer than the stutter
--- itself describes another frame and is left out; the addon and the total come from one reading.
+-- One reading of what addons took in the client's last frame. A reading with a figure longer than
+-- the stutter itself describes another frame and is left out whole.
 local function Blame(stutter)
     if not ns.ProfilerEnabled() then
         return
@@ -746,13 +821,13 @@ local function Blame(stutter)
     end
     stutter.readings = stutter.readings + 1
     local limit = stutter.ms * BLAME_SLACK
-    if name and ms > 0 and ms <= limit and ms > (stutter.addonMs or 0) then
-        stutter.name, stutter.addonMs = name, min(ms, stutter.ms)
-        stutter.overallMs = min(max(overall, ms), stutter.ms)
-        stutter.reading = stutter.readings
-    elseif not stutter.name and overall <= limit and overall > (stutter.overallMs or 0) then
-        stutter.overallMs = min(overall, stutter.ms)
+    if ms > limit or overall > limit then
+        return
     end
+    if name and ms > (stutter.addonMs or 0) then
+        stutter.name, stutter.addonMs, stutter.reading = name, min(ms, stutter.ms), stutter.readings
+    end
+    stutter.overallMs = max(stutter.overallMs or 0, min(max(overall, ms), stutter.ms))
 end
 
 local function FinishStutter(readAgain)
@@ -818,32 +893,8 @@ local function ScannedLately(now)
     return ns.memory.at ~= nil and now - ns.memory.at < MEMORY_INTERVAL_SHOWN * 1000
 end
 
--- The fallback clock can be restarted by another addon: every kept time moves back with it.
-local function Reanchor(now)
-    local jump = now - ns.frameStamp
-    ns.quietUntil = ns.quietUntil + jump
-    ns.trackedSince = ns.trackedSince + jump
-    ns.loadingSince = ns.loadingSince + jump
-    startup.mark = startup.mark + jump
-    local memory = ns.memory
-    if memory.at then
-        memory.at = memory.at + jump
-    end
-    for _, rec in ipairs(ns.list) do
-        if rec.memSeenAt then
-            rec.memSeenAt = rec.memSeenAt + jump
-        end
-        if rec.memFirstAt then
-            rec.memFirstAt = rec.memFirstAt + jump
-        end
-    end
-end
-
 local function OnUpdate(_, elapsed)
-    local now = Clock()
-    if now < ns.frameStamp then
-        Reanchor(now)
-    end
+    local now = Now()
     if not startup.done then
         startup.frames = startup.frames + 1
         if startup.sawWorld then
@@ -859,12 +910,16 @@ local function OnUpdate(_, elapsed)
     end
     ns.frameCount = ns.frameCount + 1
     if ns.loading and now - ns.loadingSince >= LOADING_LIMIT_MS then
-        ns.loading = false
+        -- Given up on: a screen lifting later is some other screen, not the login's.
+        ns.loading, startup.timedOut = false, nil
         ns.quietUntil = now + QUIET_AFTER_LOADING_MS
     end
     local quiet = ns.loading or now < ns.quietUntil
     if ns.settle and not quiet then
         Settle()
+    end
+    if ns.unbased and not quiet and not ns.holding and not ns.settle then
+        Guarded(BasePending)
     end
     if ns.stutterMark ~= db.stutterMs then
         ClearStutters()
@@ -877,7 +932,7 @@ local function OnUpdate(_, elapsed)
     ns.skipFrame = nil
     if pending then
         -- The next frame's reading can still hold the stutter's work, unless that frame has its own.
-        FinishStutter(not long and not ns.loading and not ns.loadedThisFrame)
+        FinishStutter(not long and not skip and not ns.loading and not ns.loadedThisFrame)
     end
     ns.loadedThisFrame = nil
     if not quiet and not skip and elapsed < PAUSED_FRAME_SECONDS then
@@ -927,6 +982,7 @@ local function OnUpdate(_, elapsed)
         ns.Refresh(elapsed)
     end
     ns.frameStamp = Clock()
+    lastClock = ns.frameStamp
 end
 ns.OnUpdate = OnUpdate
 
@@ -945,9 +1001,13 @@ function ns.Reset()
     local now = Clock()
     for _, rec in ipairs(ns.list) do
         rec.sum, rec.n, rec.combatSum, rec.combatN = 0, 0, 0, 0
-        rec.memFirst, rec.memFirstAt = rec.mem, rec.mem and now or nil
+        -- The next scan a minute or more after the addon's first becomes the reading to grow from.
+        rec.memFirst, rec.memFirstAt = nil, nil
         rec.memPeak = rec.mem
+        rec.growth = nil
     end
+    ns.memory.growth = nil
+    ns.wasReset = true
     local cpu = ns.cpu
     cpu.samples, cpu.sum = 0, nil
     ClearStutters()
@@ -1209,8 +1269,9 @@ function ns.Summary()
                 if (rec.mem or 0) > best.memory then
                     best.memory, summary.top.memory = rec.mem, rec
                 end
-                if rec.loadKind == "startup" and rec.loadMs > best.load then
-                    best.load, summary.top.load = rec.loadMs, rec
+                local typical = ns.LoadTypical(rec)
+                if typical and typical > best.load then
+                    best.load, summary.top.load = typical, rec
                 end
             end
         end
@@ -1306,7 +1367,7 @@ function ns.Status()
             GetTimePreciseSec and "GetTimePreciseSec" or "debugprofilestop", cpu.samples, memory.scans,
             ns.FormatMs(memory.cost), memory.slow and ", so scans are spaced out" or ""),
         ("startup %s%s: %d loads timed, %d of them after a drawn frame; %d frames drawn while loading"):format(
-            startup.done and "done" or startup.phase, startup.timedOut and " (the client never said the loading screen lifted)" or "",
+            startup.done and "done" or startup.phase, startup.unlifted and " (the client never said the loading screen lifted)" or "",
             startup.loads, startup.split or 0, startup.frames),
         ("stutters blamed on an addon from the reading on the stutter's own frame %d times, from the frame after %d times"):format(
             ns.blame.first, ns.blame.second),
@@ -1328,7 +1389,7 @@ local handlers = {}
 handlers.ADDON_LOADED = OnAddonLoaded
 
 function handlers.PLAYER_LOGIN()
-    startup.t.login = Clock()
+    startup.t.login = Now()
     if startup.phase == "files" then
         startup.phase = "login"
     end
@@ -1342,14 +1403,14 @@ end
 function handlers.PLAYER_ENTERING_WORLD(_, reloading)
     if not startup.done and not startup.sawWorld then
         startup.sawWorld, startup.reload = true, reloading and true or false
-        startup.t.world = Clock()
+        startup.t.world = Now()
         Mark()
     end
 end
 
 function handlers.LOADING_SCREEN_ENABLED()
     if startup.done and not ns.loading then
-        ns.loading, ns.loadingSince = true, Clock()
+        ns.loading, ns.loadingSince = true, Now()
         if not ns.holding and ns.settle ~= "startup" then
             Hold()
         end
@@ -1360,7 +1421,7 @@ function handlers.LOADING_SCREEN_ENABLED()
 end
 
 function handlers.LOADING_SCREEN_DISABLED()
-    local now = Clock()
+    local now = Now()
     if not startup.done then
         startup.t.screen = now
         return
@@ -1369,7 +1430,7 @@ function handlers.LOADING_SCREEN_DISABLED()
     ns.quietUntil = now + QUIET_AFTER_LOADING_MS
     if startup.timedOut then
         -- The first word from the client that the login screen lifted: that was when the game was ready.
-        startup.timedOut = nil
+        startup.timedOut, startup.unlifted = nil, nil
         startup.t.screen, startup.t.ready = now, now
         startup.totalMs = now - T0
         if startup.login then

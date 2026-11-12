@@ -251,6 +251,19 @@ T.test("a loading screen that never ends is given up on after two minutes", func
     T.eq(#ns.stutters, 1)
 end)
 
+T.test("after giving up on the login screen, a later loading screen's end is not taken for the login's", function()
+    local ns = wow.Start({ addons = Three(), stopAt = "world" })
+    wow.Run(140)
+    local total, tracked = ns.startup.totalMs, ns.TrackedSeconds()
+    T.eq(ns.startup.timedOut, nil)
+    wow.Fire("LOADING_SCREEN_ENABLED")
+    wow.Run(3)
+    wow.Fire("LOADING_SCREEN_DISABLED")
+    T.eq(ns.startup.totalMs, total)
+    T.eq(ns.db.logins[1].totalMs, math.floor(total + 0.5))
+    T.ok(ns.TrackedSeconds() > tracked)
+end)
+
 T.test("a loading screen that lifts before the world event still ends startup", function()
     local ns = wow.Start({ addons = Three(), stopAt = "login" })
     wow.Fire("LOADING_SCREEN_DISABLED")
@@ -307,6 +320,21 @@ T.test("load time is judged by the middle one of the saved runs, so one slow log
     T.eq(ns.Judge(ns.addons.Alpha), 2)
 end)
 
+T.test("the Loading tile names the addon the load verdict is about, not one slow login's", function()
+    local ns
+    for run = 1, 3 do
+        local addons = Three()
+        addons[1].load = 600
+        addons[2].load = run == 3 and 900 or 100
+        ns = wow.Start({ addons = addons, keepDB = run > 1, reload = run > 1 })
+    end
+    local tile = Tile(ns, "Loading")
+    T.eq(tile.name, "Alpha")
+    T.eq(tile.level, 2)
+    T.eq(tile.value, "600 ms at the last reload")
+    T.eq(ns.Judge(ns.addons.Bravo), 0)
+end)
+
 T.test("damaged load history in the saved settings is dropped, not tripped over", function()
     wow.Start({ addons = Three() })
     _G.AddonWeightDB.history = { Alpha = { {}, "x", 120 }, Bravo = 5, Charlie = { "y" } }
@@ -340,6 +368,26 @@ T.test("without GetTimePreciseSec the debug timer is the clock, and its restart 
         Stutter(0.3)
         T.eq(#ns.stutters, 1)
         Near(ns.TrackedSeconds(), tracked + 1.3, 0.1)
+    end)
+    wow.hasPreciseClock = true
+    T.ok(ok, tostring(err))
+end)
+
+T.test("on the debug-timer clock a restart while loading neither spoils the login time nor stalls startup", function()
+    wow.hasPreciseClock = false
+    local ok, err = pcall(function()
+        local ns = wow.Start({ addons = Three(), stopAt = "files", setup = function() wow.hasPreciseClock = false end })
+        debugprofilestart()
+        wow.Finish({ stopAt = "world" })
+        debugprofilestart()
+        wow.Run(11)
+        T.eq(ns.startup.done, true, "the ten-second give-up still comes")
+        T.ok(ns.startup.totalMs > 0 and ns.startup.totalMs < 2000, tostring(ns.startup.totalMs))
+        wow.Install({ name = "Late", lod = true })
+        wow.Run(130)
+        debugprofilestart()
+        wow.LoadAddon("Late", 20)
+        T.ok(ns.addons.Late.loadAt > 100, tostring(ns.addons.Late.loadAt))
     end)
     wow.hasPreciseClock = true
     T.ok(ok, tostring(err))
@@ -391,6 +439,15 @@ T.test("the addon that loaded Ace3 first is marked as carrying the other Ace3 ad
     T.ok(wow.popup.text:find("It carries the shared Ace3 work of other addons", 1, true))
     T.ok(table.concat(ns.Report(), "\n"):find("Bravo Bags loaded Ace3 first", 1, true))
     T.ok(ns.Status()[4]:find("Ace3 was loaded first by Bravo Bags", 1, true))
+end)
+
+T.test("a Blizzard module loaded from inside the Ace3 addon's files does not lose the carrier", function()
+    local ns = wow.Start({ stopAt = "files" })
+    _G.AceAddon30Frame = {}
+    wow.LoadAddon("Blizzard_Foo", 5)
+    wow.Install("Alpha")
+    wow.LoadAddon("Alpha", 10)
+    T.eq(ns.carrier, ns.addons.Alpha)
 end)
 
 T.test("Ace3 already present when the meter loads names no carrier", function()
@@ -466,6 +523,35 @@ T.test("with no samples yet the average falls back on the client's session avera
     T.eq(ns.Average(alpha), nil)
     alpha.session = 0.4
     T.eq(ns.Average(alpha), 0.4)
+end)
+
+T.test("after a Reset the client's average since login no longer stands in for the average", function()
+    local ns = Settled()
+    wow.Metric("Alpha", "SessionAverageTime", 2)
+    wow.Metric("Alpha", "RecentAverageTime", 0.1)
+    Open()
+    Open()
+    ns.addons.Alpha.sum, ns.addons.Alpha.n = 0, 0
+    T.eq(ns.Average(ns.addons.Alpha), 2)
+    wow.Slash("reset")
+    T.eq(ns.Average(ns.addons.Alpha), 0.1)
+    wow.Slash("top")
+    T.eq(wow.Printed("Alpha|r"), false)
+end)
+
+T.test("a Reset after the profiler failed leaves no stale hitch count or average to judge", function()
+    local ns = Settled()
+    Open()
+    wow.Metric("Alpha", "CountTimeOver50Ms", 6)
+    wow.Metric("Alpha", "SessionAverageTime", 1.5)
+    wow.Run(2)
+    T.eq(ns.Over(ns.addons.Alpha, 4), 6)
+    wow.profilerBroken = true
+    wow.Run(2)
+    ns.Reset()
+    T.eq(ns.Over(ns.addons.Alpha, 4), nil)
+    T.eq(ns.Average(ns.addons.Alpha), nil)
+    T.eq(ns.Judge(ns.addons.Alpha), 0)
 end)
 
 T.test("nothing is sampled behind a loading screen or in the seconds after it", function()
@@ -593,6 +679,60 @@ T.test("an addon loaded on demand: its own loading frame is not a hitch or its p
     T.eq(ns.Peak(late), 180)
 end)
 
+T.test("with the window closed and background measuring off, a late addon still gets its baseline two frames on", function()
+    local addons = Three()
+    addons[#addons + 1] = { name = "Late", lod = true }
+    local ns = Settled({ addons = addons })
+    ns.db.background = false
+    wow.LoadAddon("Late", 50)
+    wow.Run(1)
+    local late = ns.addons.Late
+    T.eq(late.based, true)
+    wow.Metric("Late", "CountTimeOver50Ms", 4)
+    wow.Metric("Late", "PeakTime", 180)
+    wow.Run(60)
+    Open()
+    T.eq(ns.Over(late, 4), 4)
+    T.eq(ns.Peak(late), 180)
+end)
+
+T.test("an addon loaded behind a loading screen gets its baseline when the screen's quiet seconds end", function()
+    local addons = Three()
+    addons[#addons + 1] = { name = "Late", lod = true }
+    local ns = Settled({ addons = addons })
+    wow.Fire("LOADING_SCREEN_ENABLED")
+    wow.Run(1)
+    wow.LoadAddon("Late", 50)
+    wow.Run(1)
+    wow.Fire("LOADING_SCREEN_DISABLED")
+    wow.Run(0.5)
+    Open()
+    local late = ns.addons.Late
+    T.eq(late.based, nil, "not while the quiet seconds run, whoever reads the figures")
+    wow.Metric("Late", "CountTimeOver50Ms", 3)
+    wow.Metric("Late", "PeakTime", 400)
+    wow.Run(5)
+    T.eq(late.based, true)
+    T.eq(ns.Over(late, 4), 0)
+    T.eq(ns.Peak(late), nil)
+end)
+
+T.test("a late addon's hitches are counted an hour of its own time, not the session's", function()
+    local addons = Three()
+    addons[#addons + 1] = { name = "Late", lod = true }
+    local ns = Settled({ addons = addons })
+    ns.trackedSince = ns.trackedSince - 50 * 60 * 1000
+    wow.LoadAddon("Late", 50)
+    wow.Run(2)
+    wow.Metric("Late", "CountTimeOver50Ms", 12)
+    wow.Run(600)
+    Open()
+    local rate, count = ns.SpikeRate(ns.addons.Late)
+    T.eq(count, 12)
+    Near(rate, 72, 1)
+    T.eq((ns.SpikeLevel(ns.addons.Late)), 2)
+end)
+
 T.test("hitches are judged by how many an hour, and one alone is never enough", function()
     local ns = Settled()
     Open()
@@ -610,6 +750,7 @@ T.test("hitches are judged by how many an hour, and one alone is never enough", 
     T.eq(ns.Reasons(alpha)[1], "ran over 50 ms in 5 frames (300 an hour)")
     T.eq((ns.ShortReason(alpha)), "5 hitches")
     ns.trackedSince = ns.Clock() - 3600000
+    alpha.baseAt = ns.trackedSince
     local rate = ns.SpikeRate(alpha)
     Near(rate, 5, 0.01)
     T.eq((ns.SpikeLevel(alpha)), 0, "five in an hour is under one every ten minutes")
@@ -815,6 +956,26 @@ T.test("memory that grew a lot since the addon settled in is noticed, never call
     T.eq(ns.Leak(alpha), nil)
 end)
 
+T.test("a Reset in an addon's first minute does not make its settling in a leak, and clears the rate of new memory", function()
+    local ns = wow.Start({ addons = Three() })
+    local alpha = ns.addons.Alpha
+    wow.memoryLive.Alpha = 5 * 1024
+    wow.Run(20)
+    ns.Reset()
+    T.eq(alpha.memFirst, nil)
+    wow.memoryLive.Alpha = 30 * 1024
+    wow.Run(50)
+    T.eq(alpha.memFirst, 30 * 1024, "the reading a minute after its first")
+    T.ok(alpha.growth > 100)
+    T.eq(ns.Judge(alpha), 2)
+    ns.Reset()
+    T.eq(alpha.growth, nil)
+    T.eq(ns.memory.growth, nil)
+    T.eq(ns.Judge(alpha), 0)
+    wow.Run(700)
+    T.eq(ns.Leak(alpha), nil)
+end)
+
 T.test("a big addon growing by a small part of itself is not called a leak, and a Reset starts the watch over", function()
     local ns = wow.Start({ addons = Three() })
     local alpha, bravo = ns.addons.Alpha, ns.addons.Bravo
@@ -934,6 +1095,51 @@ T.test("a reading far longer than the stutter, arriving a frame later, is not ch
     end)
     T.eq(ns.stutters[2].cause, "addon", "a little over is the two clocks disagreeing")
     T.eq(ns.stutters[2].addonMs, 150)
+end)
+
+T.test("a reading whose total is longer than the stutter is left out whole", function()
+    local ns = Settled()
+    wow.Metric("Alpha", "LastTime", 60)
+    wow.Overall("LastTime", 300)
+    Stutter(0.11)
+    T.eq(ns.stutters[1].cause, "game")
+    T.eq(ns.stutters[1].overallMs, nil)
+    T.eq(ns.addons.Alpha.stutters, 0)
+end)
+
+T.test("each reading counts for itself: a small stale one does not hide the next one's total", function()
+    local ns = Settled()
+    wow.Metric("Alpha", "LastTime", 6)
+    wow.Overall("LastTime", 9)
+    Stutter(0.1, function()
+        wow.Metric("Alpha", "LastTime", 5)
+        wow.Overall("LastTime", 92)
+    end)
+    T.eq(ns.stutters[1].cause, "addons")
+    T.eq(ns.stutters[1].overallMs, 92)
+end)
+
+T.test("the meter's own scan in the same frame as a stutter is not read as the stutter's cause", function()
+    local ns = Settled()
+    Open()
+    for _ = 1, 64 * 6 do
+        if ns.memory.scans >= 2 then
+            break
+        end
+        wow.Frame(1 / 64)
+    end
+    local scans = wow.scans
+    wow.Run(4.95)
+    T.eq(wow.scans, scans)
+    wow.Metric("Alpha", "LastTime", 30)
+    wow.Overall("LastTime", 35)
+    wow.Frame(0.12)
+    T.eq(wow.scans, scans + 1, "the scan ran in the stutter's own update")
+    wow.Metric(SELF, "LastTime", 70)
+    wow.Overall("LastTime", 100)
+    wow.Frame()
+    T.eq(ns.stutters[1].cause, "game")
+    T.eq(ns.addons[SELF].stutters, 0)
 end)
 
 T.test("an addon loading right after a stutter is not blamed for it", function()
