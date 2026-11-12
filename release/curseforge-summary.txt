@@ -1,0 +1,1 @@
+Shows how heavy each of your addons is on WoW Forever: the frame time it takes, the hitches and stutters it causes, the memory it holds and how long it takes to load. One window names the heaviest, and the figures are kept across sessions.
