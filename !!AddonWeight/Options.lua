@@ -7,12 +7,12 @@ local CONTROLS = {
     {
         key = "background",
         label = "Keep measuring with the window closed",
-        tooltip = "The averages and the combat column need this: a few reads of the client's own profiler every two seconds. Off, processor time is only measured while the window is open.",
+        tooltip = "The averages and the combat column need this: a few reads of the client's own profiler every 60 frames. Off, processor time is only measured while the window is open.",
     },
     {
         key = "memory",
         label = "Measure memory with the window closed",
-        tooltip = "One memory scan a minute, never in combat. Off, memory is only measured while the window is open. Scans a minute apart undercount how fast an addon makes new memory; the figure sharpens while the window is open.",
+        tooltip = "A memory scan stops the game for as long as it takes. Where one takes under 10 ms it runs once a minute, never in combat. Where it takes longer it runs only while a loading screen is up. Off, memory is only measured when you open the window.",
     },
     {
         key = "stutter",

@@ -230,6 +230,11 @@ local function MemoryTile(summary)
         else
             tile.detail = ("All addons: %s"):format(ns.FormatMemory(summary.memory))
         end
+        -- Where scans only run behind loading screens, say how old the reading is.
+        if ns.memory.slow and ns.memory.at then
+            tile.detail = ("%s, %s ago"):format(tile.level == 0 and ("%s in all"):format(ns.FormatMemory(summary.memory)) or tile.detail,
+                ns.FormatClock((ns.Clock() - ns.memory.at) / 1000))
+        end
     end
     return tile
 end
@@ -445,6 +450,9 @@ function ns.RowTooltipLines(rec)
     Add("Load", LoadText(rec), ns.Level(ns.LoadTypical(rec), limits.load))
     if rec.loadPeak and rec.loadPeak >= 1 then
         Add("Longest burst of work while loading", ns.FormatDuration(rec.loadPeak), ns.Level(rec.loadPeak, limits.burst))
+    end
+    if rec.name == ADDON and (ns.startup.scanMs or 0) >= 1 then
+        Add("Of that, its memory scan behind the screen", ns.FormatDuration(ns.startup.scanMs))
     end
     if rec.loadKB and rec.loadKB >= 1 then
         Add("Lua memory added while it loaded", ns.FormatMemory(rec.loadKB))
@@ -923,8 +931,8 @@ local function BuildHeaders()
             GameTooltip:SetText(all and column.allLabel or column.label, 1, 1, 1)
             GameTooltip_AddNormalLine(GameTooltip, all and column.allTip or column.tip, true)
             if column.key == "memory" and ns.memory.slow then
-                GameTooltip_AddNormalLine(GameTooltip, ("Measuring memory stops the game for %s ms with your addons, so it is done behind loading screens, when this window opens, and every %d seconds while it is open."):format(
-                    ns.FormatMs(ns.memory.cost), ns.MemoryInterval(true)), true)
+                GameTooltip_AddNormalLine(GameTooltip, ("Measuring memory stops the game for %s ms with your addons, so it is only done behind loading screens and when this window opens. Close and reopen the window for a fresh reading."):format(
+                    ns.FormatMs(ns.memory.cost)), true)
             end
             GameTooltip:Show()
         end)
@@ -936,6 +944,8 @@ end
 
 local function BuildWindow()
     window = Panel("AddonWeightFrame", ns.TITLE, WIDTH, HEIGHT)
+    -- The tabs hang below the frame: keep them on the screen too.
+    window:SetClampRectInsets(0, 0, 0, -30)
     -- The meter keeps the position itself; the client's own layout cache must not add a second anchor.
     window:SetScript("OnDragStop", function(self)
         self:StopMovingOrSizing()

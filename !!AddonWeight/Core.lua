@@ -61,15 +61,12 @@ local BUCKET_METRICS = {
 -- The profiler's "recent" figure covers 60 frames, so one sample every 60 frames misses none.
 local SAMPLE_FRAMES = 60
 local COMBAT_MIN_SAMPLES = 10
--- A memory scan stops the game for as long as it takes. One under 10 ms is not felt and may repeat;
--- a longer one runs where its pause is hidden (behind a loading screen, on opening the window) and,
--- with the window open, no more often than keeps it to a five-hundredth of the time.
+-- A memory scan stops the game for as long as it takes. One under 10 ms is not felt and may repeat
+-- on a timer. A longer one, or one whose cost is not known yet, runs only while a loading screen
+-- is up and when the window is opened (as Blizzard's own AddOn list does), never on a timer.
 local MEMORY_INTERVAL_SHOWN, MEMORY_INTERVAL_HIDDEN = 5, 60
 local MEMORY_CHEAP_MS = 10
-local MEMORY_COSTLY_SHARE = 500
-local MEMORY_COSTLY_MIN, MEMORY_COSTLY_MAX = 15, 120
-local FIRST_MEMORY_DELAY = 2
-local SCREEN_MEMORY_DELAY = 0.5
+local MEMORY_REOPEN_SECONDS = 15
 local MEMORY_SETTLE_MS = 60000
 local GROWTH_MEMORY_SECONDS = 120
 local QUIET_AFTER_LOADING_MS = 3000
@@ -114,7 +111,13 @@ local function Reanchor(jump)
     if memory.at then
         memory.at = memory.at + jump
     end
+    if ns.scannedAt then
+        ns.scannedAt = ns.scannedAt + jump
+    end
     for _, rec in ipairs(ns.list) do
+        if rec.loadedAt then
+            rec.loadedAt = rec.loadedAt + jump
+        end
         if rec.memSeenAt then
             rec.memSeenAt = rec.memSeenAt + jump
         end
@@ -303,6 +306,12 @@ local function LoadDatabase()
             if type(stats.removed) ~= "number" then
                 stats.removed = nil
             end
+            if stats.first <= 0 then
+                stats.first = stats.last > 0 and stats.last or time()
+            end
+            if stats.last <= 0 then
+                stats.last = stats.first
+            end
         end
     end
     if type(db.totals) ~= "table" then
@@ -321,7 +330,19 @@ local function LoadDatabase()
         for _, stutter in ipairs(db.stutterLog) do
             if type(stutter) == "table" and type(stutter.at) == "number" and type(stutter.ms) == "number"
                 and type(stutter.cause) == "string" and #log < ns.STUTTER_KEEP then
-                log[#log + 1] = stutter
+                for _, key in ipairs({ "name", "title" }) do
+                    if type(stutter[key]) ~= "string" then
+                        stutter[key] = nil
+                    end
+                end
+                for _, key in ipairs({ "addonMs", "overallMs" }) do
+                    if type(stutter[key]) ~= "number" then
+                        stutter[key] = nil
+                    end
+                end
+                if stutter.cause ~= "addon" or (stutter.addonMs and (stutter.name or stutter.title)) then
+                    log[#log + 1] = stutter
+                end
             end
         end
     end
@@ -391,7 +412,7 @@ local function OnAddonLoaded(name)
         -- boundary is known, and what remains after an ordinary frame is the load.
         local from = startup.mark > ns.frameStamp and startup.mark or ns.frameStamp + ns.frameMs
         rec.loadMs, rec.loadKind = max(0, now - from), "demand"
-        rec.loadAt = (now - T0) / 1000
+        rec.loadAt, rec.loadedAt = (now - T0) / 1000, now
         rec.baseAfter = ns.frameCount + 2
         if not rec.blizzard then
             ns.unbased = ns.unbased or {}
@@ -466,7 +487,9 @@ local function FinishStartup(now, timedOut)
     end
     startup.addonMs, startup.blizzardMs, startup.counted, startup.slowest = addonMs, blizzardMs, counted, slowest
     startup.estimated = estimated
-    startup.totalMs = t.ready - T0
+    -- The meter's own scan behind the screen is not the game's loading time.
+    local scan = startup.scanMs
+    startup.totalMs = max(0, t.ready - T0 - (scan and t.ready >= t.world + scan and scan or 0))
     if db then
         ns.PruneRemoved()
         local logins = db.logins
@@ -480,7 +503,6 @@ local function FinishStartup(now, timedOut)
         end
     end
     ns.settle = "startup"
-    ns.memory.next = FIRST_MEMORY_DELAY
     if db and db.loginLine and slowest then
         ns.Say(("%d addons loaded in %s; slowest %s (%s). /weight"):format(
             counted, ns.FormatDuration(addonMs), slowest.title, ns.FormatDuration(slowest.loadMs)))
@@ -613,6 +635,7 @@ local function Release()
                 for i, key in ipairs(BUCKET_METRICS) do
                     local count = profiler.GetAddOnMetric(rec.name, Metric[key]) or 0
                     rec.base[i] = (rec.base[i] or 0) + max(0, count - hold[i])
+                    rec.over[i] = count
                 end
                 local peak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
                 if peak > (rec.holdPeak or 0) then
@@ -806,10 +829,11 @@ function ns.SampleMemory()
     memory.cost = now - started
     memory.costMax = max(memory.costMax or 0, memory.cost)
     memory.slow = memory.cost >= MEMORY_CHEAP_MS
+    memory.wait = 0
     if db then
         db.scanMs = floor(memory.cost * 10 + 0.5) / 10
     end
-    ns.skipFrame = true
+    ns.scannedAt = now
     local seconds = memory.at and (now - memory.at) / 1000 or nil
     local total, growth = 0, 0
     for _, rec in ipairs(ns.list) do
@@ -866,7 +890,7 @@ local function ClearStutters()
         ns.stutters[key] = nil
     end
     for _, rec in ipairs(ns.list) do
-        rec.stutters = 0
+        rec.stutters, rec.flushedStutters = 0, 0
     end
 end
 
@@ -964,23 +988,33 @@ end
 
 -- Frames -----------------------------------------------------------------------------------
 
-local sampleFrames, memoryWait = 0, 0
+local sampleFrames = 0
 local heapLast
+
+local function CheapScan()
+    local cost = ns.memory.cost
+    return cost ~= nil and cost < MEMORY_CHEAP_MS
+end
 
 local function ScannedLately(now)
     local memory = ns.memory
-    return memory.at ~= nil and now - memory.at < (memory.slow and MEMORY_COSTLY_MIN or MEMORY_INTERVAL_SHOWN) * 1000
+    return memory.at ~= nil and now - memory.at < (CheapScan() and MEMORY_INTERVAL_SHOWN or MEMORY_REOPEN_SECONDS) * 1000
 end
 
--- Seconds between scans, or nil for none: what the last scan cost decides.
+-- Seconds between scans on a timer, or nil for no timer: only a scan known to be cheap repeats.
 function ns.MemoryInterval(shown)
-    local cost = ns.memory.cost or 0
-    if cost < MEMORY_CHEAP_MS then
+    if CheapScan() then
         return shown and MEMORY_INTERVAL_SHOWN or MEMORY_INTERVAL_HIDDEN
-    elseif shown then
-        return max(MEMORY_COSTLY_MIN, min(MEMORY_COSTLY_MAX, cost * MEMORY_COSTLY_SHARE / 1000))
     end
     return nil
+end
+
+-- A scan where its pause cannot be felt: a loading screen is up.
+local function ScanBehindScreen(now)
+    if db and (ns.watching or db.memory) and not InCombatLockdown() and not ScannedLately(now) then
+        ns.SampleMemory()
+        return ns.memory.cost
+    end
 end
 
 local function OnUpdate(_, elapsed)
@@ -1012,14 +1046,15 @@ local function OnUpdate(_, elapsed)
         Guarded(BasePending)
     end
     if ns.stutterMark ~= db.stutterMs then
+        ns.Flush()
         ClearStutters()
         ns.stutterMark = db.stutterMs
     end
 
     local ms = elapsed * 1000
     local long = ms >= db.stutterMs
-    local skip = ns.skipFrame
-    ns.skipFrame = nil
+    -- The frame the meter's own scan ended in is the meter's doing, whenever in the frame it ran.
+    local skip = ns.scannedAt ~= nil and ns.scannedAt >= now - ms
     if pending then
         -- The next frame's reading can still hold the stutter's work, unless that frame has its own.
         FinishStutter(not long and not skip and not ns.loading and not ns.loadedThisFrame)
@@ -1050,22 +1085,14 @@ local function OnUpdate(_, elapsed)
             ns.SampleCPU(shown)
         end
     end
-    local memory = ns.memory
-    if memory.next then
-        memory.next = memory.next - elapsed
-        if memory.next <= 0 and not InCombatLockdown() then
-            memory.next = nil
-            if (shown or db.memory) and not ScannedLately(now) then
-                memoryWait = 0
+    if shown or db.memory then
+        local interval = ns.MemoryInterval(shown)
+        if interval and not InCombatLockdown() then
+            local memory = ns.memory
+            memory.wait = (memory.wait or 0) + elapsed
+            if memory.wait >= interval then
                 ns.SampleMemory()
             end
-        end
-    elseif shown or db.memory then
-        memoryWait = memoryWait + elapsed
-        local interval = ns.MemoryInterval(shown)
-        if interval and memoryWait >= interval and not InCombatLockdown() then
-            memoryWait = 0
-            ns.SampleMemory()
         end
     end
     if shown and ns.Refresh then
@@ -1081,20 +1108,29 @@ function ns.Watch(shown)
     if shown and startup.done then
         ns.SampleCPU(true, true)
         if not InCombatLockdown() and not ScannedLately(Clock()) then
-            memoryWait = 0
             ns.SampleMemory()
         end
     end
 end
 
-function ns.Reset()
+-- The counters are read afresh before saving, so no hitch since the last full read is lost.
+local function FreshFlush()
+    if startup.done and ns.settle ~= "startup" then
+        ns.SampleCPU(true, true)
+    end
     ns.Flush()
+end
+
+function ns.Reset()
+    FreshFlush()
     local now = Clock()
     for _, rec in ipairs(ns.list) do
         rec.sum, rec.n, rec.combatSum, rec.combatN = 0, 0, 0, 0
         rec.flushedN, rec.flushedSum, rec.flushedCombatN, rec.flushedCombatSum = 0, 0, 0, 0
         rec.flushedHitches, rec.flushedStutters = 0, 0
-        rec.flushAt, rec.hitchFlushAt = now, now
+        if Tracked(rec) then
+            rec.flushAt, rec.hitchFlushAt = now, now
+        end
         -- The next scan a minute or more after the addon's first becomes the reading to grow from.
         rec.memFirst, rec.memFirstAt = nil, nil
         rec.memPeak = rec.mem
@@ -1333,7 +1369,7 @@ function ns.Flush()
                 rec.counted = true
                 stats.sessions = stats.sessions + 1
             end
-            local began = max(ns.trackedSince, rec.baseAt or ns.trackedSince)
+            local began = max(ns.trackedSince, rec.loadedAt or ns.trackedSince, rec.baseAt or ns.trackedSince)
             stats.seconds = stats.seconds + max(0, (now - (rec.flushAt or began)) / 1000)
             rec.flushAt = now
             stats.n, stats.sum = stats.n + rec.n - (rec.flushedN or 0), stats.sum + rec.sum - (rec.flushedSum or 0)
@@ -1342,6 +1378,11 @@ function ns.Flush()
             rec.flushedN, rec.flushedSum, rec.flushedCombatN, rec.flushedCombatSum = rec.n, rec.sum, rec.combatN, rec.combatSum
             -- Hitches are only known when the counters were just read; their hours run on their own clock.
             local count = ns.Over(rec, SPIKE_BUCKET)
+            local hold = rec.hold
+            if count and hold and hold[1] then
+                -- A loading screen is being set aside: what the counters gained behind it is not a hitch.
+                count = max(0, hold[SPIKE_BUCKET] - (rec.base[SPIKE_BUCKET] or 0))
+            end
             if count then
                 stats.hitches = stats.hitches + max(0, count - (rec.flushedHitches or 0))
                 stats.hitchSeconds = stats.hitchSeconds + max(0, (now - (rec.hitchFlushAt or began)) / 1000)
@@ -1394,7 +1435,7 @@ end
 
 -- Everything saved goes; the session under way carries on and is saved from here.
 function ns.ForgetAll()
-    ns.Flush()
+    FreshFlush()
     db.stats, db.history, db.stutterLog, db.logins = {}, {}, {}, {}
     db.totals = { sessions = 0, seconds = 0, since = time() }
     ns.life, ns.sessionCounted = {}, nil
@@ -1686,7 +1727,7 @@ function ns.Status()
         ("profiler %s; clock %s; %d processor samples, %d memory scans (last took %s ms%s)"):format(
             ns.ProfilerEnabled() and "on" or cpu.failed and "failed: " .. tostring(cpu.error) or "off",
             GetTimePreciseSec and "GetTimePreciseSec" or "debugprofilestop", cpu.samples, memory.scans,
-            ns.FormatMs(memory.cost), memory.slow and ", so scans only run behind loading screens, on opening the window and now and then while it is open" or ""),
+            ns.FormatMs(memory.cost), memory.slow and ", so scans only run behind loading screens and on opening the window" or ""),
         ("startup %s%s: %d loads timed, %d of them after a drawn frame; %d frames drawn while loading"):format(
             startup.done and "done" or startup.phase, startup.unlifted and " (the client never said the loading screen lifted)" or "",
             startup.loads, startup.split or 0, startup.frames),
@@ -1725,6 +1766,7 @@ function handlers.PLAYER_ENTERING_WORLD(_, reloading)
     if not startup.done and not startup.sawWorld then
         startup.sawWorld, startup.reload = true, reloading and true or false
         startup.t.world = Now()
+        startup.scanMs = ScanBehindScreen(startup.t.world)
         Mark()
     end
 end
@@ -1738,6 +1780,7 @@ function handlers.LOADING_SCREEN_ENABLED()
         if ns.holding then
             ns.settle = ns.settle or "screen"
         end
+        ScanBehindScreen(ns.loadingSince)
     end
 end
 
@@ -1749,13 +1792,11 @@ function handlers.LOADING_SCREEN_DISABLED()
     end
     ns.loading = false
     ns.quietUntil = now + QUIET_AFTER_LOADING_MS
-    -- The seconds after a loading screen hide a scan's pause.
-    ns.memory.next = SCREEN_MEMORY_DELAY
     if startup.timedOut then
         -- The first word from the client that the login screen lifted: that was when the game was ready.
         startup.timedOut, startup.unlifted = nil, nil
         startup.t.screen, startup.t.ready = now, now
-        startup.totalMs = now - T0
+        startup.totalMs = max(0, now - T0 - (startup.scanMs or 0))
         if startup.login then
             startup.login.totalMs = floor(startup.totalMs + 0.5)
         end
@@ -1766,6 +1807,9 @@ end
 -- Saved settings are written right after this event, on a logout and on a reload alike.
 function handlers.PLAYER_LOGOUT()
     if startup.done then
+        if pending then
+            FinishStutter(false)
+        end
         ns.SampleCPU(true, true)
         ns.Flush()
     end
