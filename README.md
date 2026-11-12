@@ -36,23 +36,42 @@ header to sort by that column; rows do not move while the mouse is over the list
 everything measured about that addon, including "Right now" and how fast it makes new memory.
 Right-click a row to disable that addon for this character and reload (it asks first).
 
-**Reset** starts the averages, hitch counts and the stutter list over: press it right before the
-fight or the place you want measured. **Copy Text** gives the whole table as text.
+**Reset** starts the session's averages, hitch counts and stutter list over: press it right before
+the fight or the place you want measured. **Copy Text** gives every table as text.
+
+## Two tabs: this session and all time
+
+The tabs under the window switch what the tiles and the list show.
+
+- **This session** is everything since the last login, reload or Reset.
+- **All time** is what each addon cost over every session, kept in the saved settings
+  (`AddonWeightDB`): frame time averaged over all samples, hitches per hour measured, its worst frame,
+  the stutters it took most of, its memory when last measured, and the middle one of its last five
+  load times. The session under way is included as it goes, so a `/reload`, a logout or a Reset
+  loses nothing. Addons that are installed but not loaded this session stay in the list, greyed and
+  marked "(not loaded)".
+
+**Removed addons.** When you delete an addon from your AddOns folder, its saved figures go at the
+next login. Turn on "Keep the figures of addons you remove" in the settings to keep them instead:
+they stay in the All time list, greyed and marked "(removed)", until you right-click the row and
+forget it. `/weight forget` clears everything saved, after asking.
 
 ## Commands
 
 | Command | Does |
 |---|---|
 | `/weight` | opens or closes the window (`/addonweight` too; also in the addon compartment) |
+| `/weight all`, `/weight session` | opens the window on that tab |
 | `/weight top` | names the addons that stand out, in chat |
 | `/weight report` | the table as text to copy |
-| `/weight reset` | starts averages, hitch counts and the stutter list over |
+| `/weight reset` | starts the session's averages, hitch counts and stutter list over (all-time figures keep what was measured) |
+| `/weight forget` | clears every saved figure, after asking |
 | `/weight config` | the settings page (Esc > Options > AddOns > Addon Weight) |
 | `/weight status` | what the meter itself is doing, for troubleshooting |
 
 Settings: keep measuring with the window closed (on), measure memory with the window closed (on),
 watch for stutters (on) and the frame length that counts as one (100 ms), say each stutter in chat
-(off), say the load time in chat after loading (off).
+(off), say the load time in chat after loading (off), keep the figures of addons you remove (off).
 
 ## The marks
 
@@ -89,25 +108,30 @@ after loading, is marked Noticeable (never Heavy for that alone: addons that cac
   verdict. An addon that loads on demand is an estimate, marked `~`, and is neither judged nor in the
   totals. Addons that loaded before the meter (a folder name sorting before `!!AddonWeight`) are not
   timed.
-- **Memory includes garbage not yet cleaned up**, and held memory alone rarely costs frames. A memory
-  scan costs a little itself, so there is one a minute with the window closed, one every 5 seconds
-  with it open, and none in combat. The "new memory" rate is taken from rises between scans, so it
-  is a floor, and it sharpens while the window is open. The whole interface's rate in the report
-  comes from the Lua heap itself, frame by frame.
+- **Memory includes garbage not yet cleaned up**, and held memory alone rarely costs frames.
+  Measuring it stops the game for as long as the scan takes, and with many large addons that is
+  long enough to feel. So the meter times every scan and never scans in combat. A scan under 10 ms
+  repeats once a minute with the window closed and every 5 seconds with it open. A longer one only
+  runs where its pause is hidden or asked for: in the seconds after a loading screen, when you open
+  the window, and with the window open no more often than keeps it to a five-hundredth of the time
+  (a 100 ms scan every 50 seconds). `/weight status` and the Memory column's tooltip say what a scan
+  costs on your setup. The "new memory" rate is taken from rises between scans, so it is a floor.
+  The whole interface's rate in the report comes from the Lua heap itself, frame by frame.
 - **Stutters** are whole frames over the mark, loading screens and the three seconds after one left
   out. Blame comes from what the profiler says each addon took in that frame: one addon if it took at
   least half, addons together if they all did, otherwise no addon (the game itself, the graphics
   card, the disk, or addon code the profiler cannot see). The frame after the meter's own memory
   scan is never counted.
 - The meter lists itself. With the window closed it reads the profiler twice per addon every 60
-  frames and the Lua heap size once a frame.
+  frames and the Lua heap size once a frame, and adds the session's figures to the saved ones at
+  logout, at a Reset and while the All time tab is open.
 
 ## Other tools
 
 Blizzard's AddOn list already shows a processor share and memory per addon in its tooltips. Numy's
 Addon Profiler, Laggy Addon Detector and AddonAudit also read the client's profiler on Forever.
 Addon Weight adds load times, the stutter log with a cause, the combat average, the Ace3 carrier
-warning and one reason per addon.
+warning, one reason per addon and figures kept across sessions.
 
 ## Install
 
@@ -142,7 +166,10 @@ The first rows settle things the source cannot: paste `/weight status` after doi
 | The loading screen's end is seen | `/weight status` after a `/reload` | no "(the client never said the loading screen lifted)"; the Loading tile's total near what you felt |
 | The profiler is on | `/weight status` | "profiler on" |
 | Which reading carries the blame | `/weight status` after a few stutters blamed on an addon | counts for "the stutter's own frame" and "the frame after" |
-| A memory scan's cost | `/weight status` with the window open | "last took N ms"; under 10 is normal |
+| A memory scan's cost | `/weight status` | "last took N ms"; at 10 or more the meter only scans behind loading screens, on opening the window and now and then while it is open |
+| The meter does not hitch | play with the window closed, then open | no regular pause; the meter's own row stays near 0 hitches |
+| Figures survive | `/reload`, then the All time tab | the same addons with their averages; "2 sessions" in the line above the tiles |
+| The tabs draw right | `/weight`, click each tab | two tabs under the window, the selected one raised, not covering the buttons |
 | The window draws right | `/weight` | tiles, striped rows, headers with a sort arrow, the alert icon on heavy rows, nothing overlapping |
 | The sort arrow fits the narrow headers | `/run for i,h in ipairs(AddonWeightFrame.headers) do print(i, h.arrow:GetWidth(), h.Text:GetLeft()-h:GetLeft()-3-h.arrow:GetWidth()) end` | the last number 2 or more on every line |
 | The report opens at its top | `/weight report`, then `/dump AddonWeightReportFrame.scroll:GetVerticalScroll()` | 0 |
