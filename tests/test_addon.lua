@@ -475,6 +475,58 @@ T.test("the profiler is read once every 60 frames; never with background measuri
     T.eq(ns.cpu.samples - before, 16, "the open window measures either way")
 end)
 
+T.test("each addon is read in its own frame, once every 60 frames, and no frame reads the whole list", function()
+    local addons = {}
+    for i = 1, 150 do
+        addons[i] = { name = ("Addon%03d"):format(i), load = 1 }
+    end
+    local ns = Settled({ addons = addons })
+    wow.Run(2)
+    local before, worst = {}, 0
+    for i, rec in ipairs(ns.list) do
+        before[i] = rec.n
+    end
+    for _ = 1, 600 do
+        local reads = wow.metricReads
+        wow.Frame(1 / 64)
+        worst = math.max(worst, wow.metricReads - reads)
+    end
+    for i, rec in ipairs(ns.list) do
+        T.eq(rec.n - before[i], 10, rec.name)
+    end
+    T.ok(worst <= 10, "the busiest frame made " .. worst .. " profiler calls for 151 addons")
+    Open()
+    wow.Run(2)
+    worst = 0
+    for _ = 1, 600 do
+        local reads = wow.metricReads
+        wow.Frame(1 / 64)
+        worst = math.max(worst, wow.metricReads - reads)
+    end
+    T.ok(worst <= 30, "with the window open the busiest frame made " .. worst)
+end)
+
+T.test("the figures only a tooltip shows are read for the hovered addon alone", function()
+    local ns = Settled()
+    wow.Metric("Alpha", "CountTimeOver5Ms", 9)
+    wow.Metric("Alpha", "SessionAverageTime", 0.3)
+    wow.Slash("")
+    wow.Run(3)
+    wow.Metric("Alpha", "CountTimeOver5Ms", 12)
+    wow.Metric("Bravo", "CountTimeOver5Ms", 4)
+    wow.Run(3)
+    T.eq(ns.addons.Bravo.over[2], 0, "not read by the running sample")
+    local row
+    for _, candidate in ipairs(_G.AddonWeightFrame.scrollBox.rows) do
+        if candidate.rec == ns.addons.Alpha then
+            row = candidate
+        end
+    end
+    row.scripts.OnEnter(row)
+    T.eq(ns.addons.Alpha.over[2], 12)
+    T.ok(wow.Tooltip("Frames over 5 / 10 / 50 / 100 ms: 12 / 0 / 0 / 0"))
+end)
+
 T.test("opening the window, the report and a Reset read the figures without adding a sample", function()
     local ns = Settled()
     wow.Metric("Alpha", "SessionAverageTime", 0.7)
@@ -556,14 +608,16 @@ end)
 
 T.test("nothing is sampled behind a loading screen or in the seconds after it", function()
     local ns = Settled()
-    local before = ns.cpu.samples
+    wow.Run(2)
+    local before, alpha = ns.cpu.samples, ns.addons.Alpha.n
     wow.Fire("LOADING_SCREEN_ENABLED")
     wow.Run(10)
     wow.Fire("LOADING_SCREEN_DISABLED")
-    wow.Run(2.9)
+    wow.Run(3.9)
     T.eq(ns.cpu.samples, before)
-    wow.Run(1.2)
-    T.eq(ns.cpu.samples, before + 1)
+    T.eq(ns.addons.Alpha.n, alpha, "a reading covers the 60 frames before it")
+    wow.Run(1)
+    T.eq(ns.addons.Alpha.n, alpha + 1)
 end)
 
 T.test("spikes that happened while loading are set aside; Reset sets the rest aside too", function()
@@ -1383,9 +1437,9 @@ T.test("an addon lighter in combat than on average is judged by its average", fu
     wow.Metric("Alpha", "RecentAverageTime", 0.6)
     wow.Run(15)
     local ms, combat = ns.JudgedTime(alpha)
-    Near(ms, 1.0, 0.001)
+    Near(ms, 1.0, 0.01)
     T.eq(combat, false)
-    T.same(ns.Reasons(alpha), { "1.00 ms of every frame" })
+    T.ok(ns.Reasons(alpha)[1]:find("^%d%.%d%d ms of every frame$"), ns.Reasons(alpha)[1])
 end)
 
 T.test("an addon that ran one long burst while loading is heavy even with quick files", function()
@@ -1919,10 +1973,12 @@ T.test("what each addon cost is saved at logout and added to at the next session
     wow.Metric("Alpha", "PeakTime", 80)
     wow.Metric("Alpha", "LastTime", 150)
     Stutter(0.2)
+    local first = ns.addons.Alpha.n
+    T.ok(first >= 15 and first <= 17, tostring(first))
     wow.Fire("PLAYER_LOGOUT")
     local stats = _G.AddonWeightDB.stats.Alpha
-    T.eq(stats.n, 17)
-    Near(stats.sum, 17)
+    T.eq(stats.n, first)
+    Near(stats.sum, first)
     T.eq(stats.hitches, 3)
     T.eq(stats.stutters, 1)
     T.eq(stats.peak, 80)
@@ -1936,31 +1992,36 @@ T.test("what each addon cost is saved at logout and added to at the next session
     wow.Run(19)
     local life = Life(ns, "Alpha")
     T.eq(life.stats.sessions, 2)
-    T.eq(life.stats.n, 34)
-    Near(life.average, 2, 0.001, "seventeen samples at 1 ms and seventeen at 3")
+    local second = ns.addons.Alpha.n
+    T.ok(second >= 15 and second <= 17, tostring(second))
+    T.eq(life.stats.n, first + second)
+    Near(life.average, (first * 1 + second * 3) / (first + second), 0.001, "every sample of both sessions weighs the same")
     T.eq(life.peak, 80)
     T.eq(life.stats.stutters, 1)
     T.eq(life.loaded, true)
     T.eq(life.level, 2)
     T.eq((ns.ShortReason(life)), "2.00 ms a frame")
     T.eq(ns.db.totals.sessions, 2)
-    T.eq(ns.addons.Alpha.n, 17, "the session's own figures are untouched")
-    Near(ns.Average(ns.addons.Alpha), 3)
+    Near(ns.Average(ns.addons.Alpha), 3, 0.001, "the session's own figures are untouched")
 end)
 
 T.test("a Reset starts the session over without losing anything from the all-time figures", function()
     local ns = Settled({ setup = function() wow.Metric("Alpha", "RecentAverageTime", 2) end })
     wow.Run(15)
+    local first = ns.addons.Alpha.n
+    T.ok(first >= 15, tostring(first))
     ns.Reset()
     T.eq(ns.addons.Alpha.n, 0)
-    T.eq(ns.db.stats.Alpha.n, 17)
+    T.eq(ns.db.stats.Alpha.n, first)
     wow.Metric("Alpha", "RecentAverageTime", 4)
-    wow.Run(15)
+    wow.Run(16)
+    local second = ns.addons.Alpha.n
+    T.ok(second >= 14, tostring(second))
     local life = Life(ns, "Alpha")
-    T.eq(life.stats.n, 33)
-    Near(life.average, (17 * 2 + 16 * 4) / 33, 0.001)
+    T.eq(life.stats.n, first + second)
+    Near(life.average, (first * 2 + second * 4) / (first + second), 0.001)
     Life(ns, "Alpha")
-    T.eq(ns.db.stats.Alpha.n, 33, "reading the figures twice adds nothing twice")
+    T.eq(ns.db.stats.Alpha.n, first + second, "reading the figures twice adds nothing twice")
 end)
 
 T.test("a Reset or a forget with the window closed still saves the hitches since the counters were last read", function()

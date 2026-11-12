@@ -537,6 +537,8 @@ local function ShowRowTooltip(row)
     if rec.life then
         return ShowLifeTooltip(row)
     end
+    -- The figures only a tooltip shows are read for this one addon, when asked for.
+    ns.ReadDetail(rec)
     GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
     GameTooltip:SetText(rec.title, 1, 1, 1)
     local version = C_AddOns.GetAddOnMetadata(rec.name, "Version")

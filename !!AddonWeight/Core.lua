@@ -60,6 +60,7 @@ local BUCKET_METRICS = {
 
 -- The profiler's "recent" figure covers 60 frames, so one sample every 60 frames misses none.
 local SAMPLE_FRAMES = 60
+local PEAK_EVERY = 10
 local COMBAT_MIN_SAMPLES = 10
 -- A memory scan stops the game for as long as it takes. One under 10 ms is not felt and may repeat
 -- on a timer. A longer one, or one whose cost is not known yet, runs only while a loading screen
@@ -553,7 +554,7 @@ local Metric = Enum and Enum.AddOnProfilerMetric
 local function ClearFigures()
     for _, rec in ipairs(ns.list) do
         rec.recent, rec.session = nil, nil
-        for i in ipairs(rec.over) do
+        for i = 1, #BUCKET_METRICS do
             rec.over[i] = nil
         end
     end
@@ -674,45 +675,73 @@ local function Settle()
     ns.settle = nil
 end
 
--- `full` also reads the figures only the window and the report show; `displayOnly` reads without
--- adding to the averages, which count one sample per 60 frames and nothing else.
-local function SampleCPU(full, displayOnly)
-    local cpu = ns.cpu
-    local combat = InCombatLockdown() and true or false
-    local behindScreen = ns.loading or ns.holding or ns.settle
-    for _, rec in ipairs(ns.list) do
-        if Tracked(rec) and Profiled(rec) then
-            local peak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
-            if not rec.based and not behindScreen and (rec.baseAfter or 0) <= ns.frameCount then
-                SetBase(rec, peak)
-            end
-            if rec.based then
-                local recent = profiler.GetAddOnMetric(rec.name, Metric.RecentAverageTime) or 0
-                rec.recent = recent
-                if not displayOnly then
-                    rec.sum, rec.n = rec.sum + recent, rec.n + 1
-                    if combat then
-                        rec.combatSum, rec.combatN = rec.combatSum + recent, rec.combatN + 1
-                    end
-                end
-                rec.peak = peak
-                if not behindScreen and peak > rec.peakBase and peak > (rec.peakSeen or 0) then
-                    rec.peakSeen = peak
-                end
-                if full then
-                    rec.session = profiler.GetAddOnMetric(rec.name, Metric.SessionAverageTime) or 0
-                    rec.encounter = profiler.GetAddOnMetric(rec.name, Metric.EncounterAverageTime) or 0
-                    ReadBuckets(rec, rec.over)
-                end
-            end
+-- Reads one addon's figures. `level` 0 is what the averages need (the recent figure, and the
+-- lifetime peak only now and then, since a peak cannot be missed by reading it late); 1 adds what
+-- the window's list shows (the peak and the counters from 50 ms up); 2 adds what only a tooltip or
+-- the report shows. `count` adds the reading to the averages.
+local slotCycle = 0
+
+local function ReadRecord(rec, level, count, combat, behindScreen)
+    if not (Tracked(rec) and Profiled(rec)) then
+        return
+    end
+    local peak
+    if level > 0 or not rec.based or (slotCycle + (rec.slot or 0)) % PEAK_EVERY == 0 then
+        peak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
+    end
+    if not rec.based then
+        if behindScreen or (rec.baseAfter or 0) > ns.frameCount then
+            return
+        end
+        SetBase(rec, peak)
+    end
+    local recent = profiler.GetAddOnMetric(rec.name, Metric.RecentAverageTime) or 0
+    rec.recent = recent
+    if count then
+        rec.sum, rec.n = rec.sum + recent, rec.n + 1
+        if combat then
+            rec.combatSum, rec.combatN = rec.combatSum + recent, rec.combatN + 1
         end
     end
+    if peak then
+        rec.peak = peak
+        if not behindScreen and peak > rec.peakBase and peak > (rec.peakSeen or 0) then
+            rec.peakSeen = peak
+        end
+    end
+    if level >= 1 then
+        for i = SPIKE_BUCKET, #BUCKET_METRICS do
+            rec.over[i] = profiler.GetAddOnMetric(rec.name, Metric[BUCKET_METRICS[i]]) or 0
+        end
+    end
+    if level >= 2 then
+        rec.session = profiler.GetAddOnMetric(rec.name, Metric.SessionAverageTime) or 0
+        rec.encounter = profiler.GetAddOnMetric(rec.name, Metric.EncounterAverageTime) or 0
+        for i = 1, SPIKE_BUCKET - 1 do
+            rec.over[i] = profiler.GetAddOnMetric(rec.name, Metric[BUCKET_METRICS[i]]) or 0
+        end
+    end
+end
+
+local function ReadTotals(count)
+    local cpu = ns.cpu
     cpu.overall = profiler.GetOverallMetric(Metric.RecentAverageTime) or 0
     cpu.application = profiler.GetApplicationMetric(Metric.RecentAverageTime) or 0
-    if not displayOnly then
+    if count then
         cpu.samples = cpu.samples + 1
         cpu.sum = (cpu.sum or 0) + cpu.overall
     end
+end
+
+-- Every addon at once, for a moment the player asked for (opening the window, the report, a Reset)
+-- or the logout. `full` reads everything; `displayOnly` leaves the averages alone.
+local function SampleCPU(full, displayOnly)
+    local combat = InCombatLockdown() and true or false
+    local behindScreen = ns.loading or ns.holding or ns.settle
+    for _, rec in ipairs(ns.list) do
+        ReadRecord(rec, full and 2 or 0, not displayOnly, combat, behindScreen)
+    end
+    ReadTotals(not displayOnly)
 end
 
 function ns.SampleCPU(full, displayOnly)
@@ -721,6 +750,68 @@ function ns.SampleCPU(full, displayOnly)
         return false
     end
     return Guarded(SampleCPU, full, displayOnly)
+end
+
+-- One addon in full, for its tooltip.
+function ns.ReadDetail(rec)
+    if ns.cpu.enabled == false or not ns.ProfilerEnabled() then
+        return false
+    end
+    return Guarded(ReadRecord, rec, 2, false, false, ns.loading or ns.holding or ns.settle)
+end
+
+-- The running sample. Each addon has one of 60 frame slots and is read in its own frame, every
+-- 60 frames: the readings still tile the profiler's 60-frame window per addon, and no frame
+-- carries the whole list's reads.
+local slots, slotOf, nextSlot, slotted = {}, 0, 0, 0
+
+local function AssignSlots()
+    for _, rec in ipairs(ns.list) do
+        if not rec.slot and rec.installed and not rec.blizzard then
+            rec.slot = nextSlot
+            nextSlot = (nextSlot + 1) % SAMPLE_FRAMES
+            local bucket = slots[rec.slot]
+            if not bucket then
+                bucket = {}
+                slots[rec.slot] = bucket
+            end
+            bucket[#bucket + 1] = rec
+        end
+    end
+end
+
+local function SampleSlot(shown)
+    if slotted ~= #ns.list then
+        AssignSlots()
+        slotted = #ns.list
+    end
+    if slotOf == 0 then
+        slotCycle = slotCycle + 1
+        ReadTotals(true)
+    end
+    local bucket = slots[slotOf]
+    if bucket then
+        local combat = InCombatLockdown() and true or false
+        local behindScreen = ns.loading or ns.holding or ns.settle
+        for _, rec in ipairs(bucket) do
+            ReadRecord(rec, shown and 1 or 0, true, combat, behindScreen)
+        end
+    end
+end
+
+-- Called once a frame while measuring. Whether the profiler is on is asked once per round.
+local function StepSample(shown)
+    slotOf = (slotOf + 1) % SAMPLE_FRAMES
+    local cpu = ns.cpu
+    if slotOf == 0 or cpu.enabled == nil then
+        cpu.enabled = ns.ProfilerEnabled()
+        if not cpu.enabled then
+            ClearFigures()
+        end
+    end
+    if cpu.enabled and not Guarded(SampleSlot, shown) then
+        cpu.enabled = false
+    end
 end
 
 -- Before the first sample the client's own average since login stands in; after a Reset that
@@ -988,7 +1079,7 @@ end
 
 -- Frames -----------------------------------------------------------------------------------
 
-local sampleFrames = 0
+local sinceQuiet = 0
 local heapLast
 
 local function CheapScan()
@@ -1077,12 +1168,12 @@ local function OnUpdate(_, elapsed)
 
     local shown = ns.watching
     if quiet then
-        sampleFrames = 0
+        sinceQuiet = 0
     elseif shown or db.background then
-        sampleFrames = sampleFrames + 1
-        if sampleFrames >= SAMPLE_FRAMES then
-            sampleFrames = 0
-            ns.SampleCPU(shown)
+        -- A reading covers the 60 frames before it: none is taken until that many lie after the quiet.
+        sinceQuiet = sinceQuiet + 1
+        if sinceQuiet > SAMPLE_FRAMES then
+            StepSample(shown)
         end
     end
     if shown or db.memory then
@@ -1143,7 +1234,7 @@ function ns.Reset()
     ClearStutters()
     ns.heap.rise = 0
     ns.trackedSince = now
-    sampleFrames = 0
+    sinceQuiet = 0
     if startup.done and ns.settle ~= "startup" then
         ns.Baseline(false)
         if ns.holding then
