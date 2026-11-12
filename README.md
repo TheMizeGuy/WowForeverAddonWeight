@@ -139,7 +139,9 @@ warning, one reason per addon and figures kept across sessions.
 
 ## Install
 
-Copy the `!!AddonWeight` folder into `World of Warcraft\_forever_\Interface\AddOns`. The folder name
+From CurseForge: [WoW Forever Addon Weight](https://www.curseforge.com/wow/addons/wow-forever-addon-weight). Or take
+the zip from this repository's releases and copy the `!!AddonWeight` folder into
+`World of Warcraft\_forever_\Interface\AddOns`. The folder name
 starts with `!!` on purpose: addons load in name order, and the meter has to load first to time the
 others. A new addon shows up after logging out to the character list.
 
