@@ -2,7 +2,7 @@
 ## Title: Addon Weight
 ## Notes: How heavy each of your other addons is: the frame time it takes, the stutters it causes, the memory it holds and how long it takes to load. /weight opens the window.
 ## Author: TheMizeGuy
-## Version: 1.1.0
+## Version: 1.1.1
 ## Category: Development Tools
 ## IconTexture: Interface\Icons\INV_Stone_WeightStone_05
 ## SavedVariables: AddonWeightDB

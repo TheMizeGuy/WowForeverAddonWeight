@@ -253,7 +253,7 @@ local function LoadTile(summary)
         if tile.level == 0 then
             tile.grey, tile.detail = true, ("Nothing stands out. %s in all"):format(ns.FormatDuration(summary.addonMs))
         else
-            tile.detail = ("All addons: %s of a %s %s"):format(ns.FormatDuration(summary.addonMs), ns.FormatDuration(summary.totalMs), kind)
+            tile.detail = ("All addons: %s, %s %s"):format(ns.FormatDuration(summary.addonMs), kind, ns.FormatDuration(summary.totalMs))
         end
     end
     return tile
