@@ -124,9 +124,11 @@ after loading, is marked Noticeable (never Heavy for that alone: addons that cac
   least half, addons together if they all did, otherwise no addon (the game itself, the graphics
   card, the disk, or addon code the profiler cannot see). The frame after the meter's own memory
   scan is never counted.
-- The meter lists itself. With the window closed it reads the profiler twice per addon every 60
-  frames and the Lua heap size once a frame, and adds the session's figures to the saved ones at
-  logout, at a Reset and while the All time tab is open.
+- The meter lists itself. With the window closed it reads the profiler once per addon every 60
+  frames, each addon in a frame of its own (about one client call a frame with 60 addons), and the
+  Lua heap size once a frame. With the window open it reads six figures per addon the same way, and
+  the figures only a tooltip shows for the hovered row alone. It adds the session's figures to the
+  saved ones at logout, at a Reset and while the All time tab is open.
 
 ## Other tools
 

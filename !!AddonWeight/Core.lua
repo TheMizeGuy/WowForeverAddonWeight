@@ -622,6 +622,10 @@ local function Hold()
                 rec.hold = rec.hold or {}
                 ReadBuckets(rec, rec.hold)
                 rec.holdPeak = profiler.GetAddOnMetric(rec.name, Metric.PeakTime) or 0
+                -- The peak is not read every round: one that rose before this screen is the session's own.
+                if rec.holdPeak > rec.peakBase and rec.holdPeak > (rec.peakSeen or 0) then
+                    rec.peakSeen = rec.holdPeak
+                end
             end
         end
     end)
