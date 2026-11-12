@@ -22,6 +22,11 @@ ns.list = {}
 ns.stutters = {}
 ns.STUTTER_KEEP = 50
 ns.HISTORY_KEEP = 5
+ns.life = {}
+ns.STAT_NUMBERS = {
+    "first", "last", "sessions", "seconds", "n", "sum", "combatN", "combatSum", "peak", "band",
+    "hitches", "hitchSeconds", "stutters", "mem", "memMax", "burst",
+}
 
 ns.DEFAULTS = {
     background = true,
@@ -30,6 +35,7 @@ ns.DEFAULTS = {
     stutterMs = 100,
     stutterChat = false,
     loginLine = false,
+    keepRemoved = false,
 }
 ns.STUTTER_MIN, ns.STUTTER_MAX, ns.STUTTER_STEP = 40, 500, 10
 
@@ -55,9 +61,15 @@ local BUCKET_METRICS = {
 -- The profiler's "recent" figure covers 60 frames, so one sample every 60 frames misses none.
 local SAMPLE_FRAMES = 60
 local COMBAT_MIN_SAMPLES = 10
-local MEMORY_INTERVAL_SHOWN, MEMORY_INTERVAL_HIDDEN, MEMORY_INTERVAL_SLOW = 5, 60, 15
-local MEMORY_SLOW_MS = 10
+-- A memory scan stops the game for as long as it takes. One under 10 ms is not felt and may repeat;
+-- a longer one runs where its pause is hidden (behind a loading screen, on opening the window) and,
+-- with the window open, no more often than keeps it to a five-hundredth of the time.
+local MEMORY_INTERVAL_SHOWN, MEMORY_INTERVAL_HIDDEN = 5, 60
+local MEMORY_CHEAP_MS = 10
+local MEMORY_COSTLY_SHARE = 500
+local MEMORY_COSTLY_MIN, MEMORY_COSTLY_MAX = 15, 120
 local FIRST_MEMORY_DELAY = 2
+local SCREEN_MEMORY_DELAY = 0.5
 local MEMORY_SETTLE_MS = 60000
 local GROWTH_MEMORY_SECONDS = 120
 local QUIET_AFTER_LOADING_MS = 3000
@@ -272,11 +284,58 @@ local function LoadDatabase()
     if type(db.logins) ~= "table" then
         db.logins = {}
     end
+    -- Figures kept across sessions, one entry per addon; anything that is not what the meter wrote is dropped.
+    if type(db.stats) ~= "table" then
+        db.stats = {}
+    end
+    for name, stats in pairs(db.stats) do
+        if type(name) ~= "string" or type(stats) ~= "table" then
+            db.stats[name] = nil
+        else
+            for _, key in ipairs(ns.STAT_NUMBERS) do
+                if type(stats[key]) ~= "number" then
+                    stats[key] = 0
+                end
+            end
+            if type(stats.title) ~= "string" then
+                stats.title = name
+            end
+            if type(stats.removed) ~= "number" then
+                stats.removed = nil
+            end
+        end
+    end
+    if type(db.totals) ~= "table" then
+        db.totals = {}
+    end
+    for _, key in ipairs({ "sessions", "seconds" }) do
+        if type(db.totals[key]) ~= "number" then
+            db.totals[key] = 0
+        end
+    end
+    if type(db.totals.since) ~= "number" then
+        db.totals.since = time()
+    end
+    local log = {}
+    if type(db.stutterLog) == "table" then
+        for _, stutter in ipairs(db.stutterLog) do
+            if type(stutter) == "table" and type(stutter.at) == "number" and type(stutter.ms) == "number"
+                and type(stutter.cause) == "string" and #log < ns.STUTTER_KEEP then
+                log[#log + 1] = stutter
+            end
+        end
+    end
+    db.stutterLog = log
     if type(db.window) ~= "table" then
         db.window = {}
     end
-    db.schema = 1
+    db.schema = 2
     ns.db = db
+    if type(db.scanMs) == "number" then
+        ns.memory.cost, ns.memory.slow = db.scanMs, db.scanMs >= MEMORY_CHEAP_MS
+    else
+        db.scanMs = nil
+    end
     ns.stutterMark = db.stutterMs
 end
 
@@ -401,16 +460,15 @@ local function FinishStartup(now, timedOut)
             estimated = estimated + 1
         end
     end
+    for _, rec in ipairs(ns.list) do
+        rec.typical = nil
+        rec.typical = ns.LoadTypical(rec)
+    end
     startup.addonMs, startup.blizzardMs, startup.counted, startup.slowest = addonMs, blizzardMs, counted, slowest
     startup.estimated = estimated
     startup.totalMs = t.ready - T0
     if db then
-        for name in pairs(db.history) do
-            local rec = ns.addons[name]
-            if not (rec and rec.installed) then
-                db.history[name] = nil
-            end
-        end
+        ns.PruneRemoved()
         local logins = db.logins
         startup.login = {
             at = time(), reload = startup.reload and true or false,
@@ -446,14 +504,20 @@ end
 function ns.LoadTypical(rec)
     if rec.loadKind ~= "startup" then
         return nil
+    elseif rec.typical then
+        return rec.typical
     end
     local runs = db and db.history[rec.name]
     if not runs or #runs < 3 then
         return rec.loadMs
     end
+    return ns.Median(runs)
+end
+
+function ns.Median(runs)
     local sorted = {}
-    for i, ms in ipairs(runs) do
-        sorted[i] = ms
+    for i, value in ipairs(runs) do
+        sorted[i] = value
     end
     table.sort(sorted)
     return sorted[floor((#sorted + 1) / 2)]
@@ -703,8 +767,11 @@ function ns.SpikeRate(rec)
 end
 
 function ns.SpikeLevel(rec)
-    local rate, count = ns.SpikeRate(rec)
-    if not rate or count == 0 then
+    return ns.SpikeScore(ns.SpikeRate(rec))
+end
+
+function ns.SpikeScore(rate, count)
+    if not rate or not count or count == 0 then
         return 0, 0
     end
     local marks = ns.SPIKES
@@ -737,7 +804,11 @@ function ns.SampleMemory()
     UpdateAddOnMemoryUsage()
     local now = Clock()
     memory.cost = now - started
-    memory.slow = memory.cost >= MEMORY_SLOW_MS
+    memory.costMax = max(memory.costMax or 0, memory.cost)
+    memory.slow = memory.cost >= MEMORY_CHEAP_MS
+    if db then
+        db.scanMs = floor(memory.cost * 10 + 0.5) / 10
+    end
     ns.skipFrame = true
     local seconds = memory.at and (now - memory.at) / 1000 or nil
     local total, growth = 0, 0
@@ -864,6 +935,13 @@ local function FinishStutter(readAgain)
     while #list > ns.STUTTER_KEEP do
         table.remove(list, 1)
     end
+    if db then
+        local log = db.stutterLog
+        log[#log + 1] = stutter
+        while #log > ns.STUTTER_KEEP do
+            table.remove(log, 1)
+        end
+    end
     if db and db.stutterChat then
         ns.Say(ns.DescribeStutter(stutter))
     end
@@ -890,7 +968,19 @@ local sampleFrames, memoryWait = 0, 0
 local heapLast
 
 local function ScannedLately(now)
-    return ns.memory.at ~= nil and now - ns.memory.at < MEMORY_INTERVAL_SHOWN * 1000
+    local memory = ns.memory
+    return memory.at ~= nil and now - memory.at < (memory.slow and MEMORY_COSTLY_MIN or MEMORY_INTERVAL_SHOWN) * 1000
+end
+
+-- Seconds between scans, or nil for none: what the last scan cost decides.
+function ns.MemoryInterval(shown)
+    local cost = ns.memory.cost or 0
+    if cost < MEMORY_CHEAP_MS then
+        return shown and MEMORY_INTERVAL_SHOWN or MEMORY_INTERVAL_HIDDEN
+    elseif shown then
+        return max(MEMORY_COSTLY_MIN, min(MEMORY_COSTLY_MAX, cost * MEMORY_COSTLY_SHARE / 1000))
+    end
+    return nil
 end
 
 local function OnUpdate(_, elapsed)
@@ -972,8 +1062,8 @@ local function OnUpdate(_, elapsed)
         end
     elseif shown or db.memory then
         memoryWait = memoryWait + elapsed
-        local interval = shown and (memory.slow and MEMORY_INTERVAL_SLOW or MEMORY_INTERVAL_SHOWN) or MEMORY_INTERVAL_HIDDEN
-        if memoryWait >= interval and not InCombatLockdown() then
+        local interval = ns.MemoryInterval(shown)
+        if interval and memoryWait >= interval and not InCombatLockdown() then
             memoryWait = 0
             ns.SampleMemory()
         end
@@ -998,9 +1088,13 @@ function ns.Watch(shown)
 end
 
 function ns.Reset()
+    ns.Flush()
     local now = Clock()
     for _, rec in ipairs(ns.list) do
         rec.sum, rec.n, rec.combatSum, rec.combatN = 0, 0, 0, 0
+        rec.flushedN, rec.flushedSum, rec.flushedCombatN, rec.flushedCombatSum = 0, 0, 0, 0
+        rec.flushedHitches, rec.flushedStutters = 0, 0
+        rec.flushAt, rec.hitchFlushAt = now, now
         -- The next scan a minute or more after the addon's first becomes the reading to grow from.
         rec.memFirst, rec.memFirstAt = nil, nil
         rec.memPeak = rec.mem
@@ -1060,19 +1154,20 @@ local FRAME_PARTS = { "cpu", "spike", "growth" }
 local OTHER_PARTS = { "memory", "load", "leak" }
 local KIND = { memory = "memory", leak = "memory", load = "loading" }
 
--- An addon is as heavy as its worst measure. Measures that cost frames (time, spikes, garbage)
--- rank above those that cost memory or loading time at the same level.
-function ns.Judge(rec)
+-- Scores a set of figures (ms, combat, hitches, rate, growth, mem, load, burst, leak) into `out`.
+-- An addon is as heavy as its worst measure. Measures that cost frames (time, hitches, new
+-- memory) rank above those that cost memory or loading time at the same level.
+local function Score(out, f)
     local limits = ns.LIMITS
-    local parts = rec.parts or {}
-    rec.parts = parts
-    parts.cpu = Norm((ns.JudgedTime(rec)), limits.cpu)
-    local _, spike = ns.SpikeLevel(rec)
+    local parts = out.parts or {}
+    out.parts, out.figures = parts, f
+    parts.cpu = Norm(f.ms, limits.cpu)
+    local _, spike = ns.SpikeScore(f.rate, f.hitches)
     parts.spike = spike
-    parts.growth = Norm(rec.growth, limits.growth)
-    parts.memory = Norm(rec.mem, limits.memory)
-    parts.load = max(Norm(ns.LoadTypical(rec), limits.load), Norm(rec.loadPeak, limits.burst))
-    parts.leak = ns.Leak(rec) and 0.5 or 0
+    parts.growth = Norm(f.growth, limits.growth)
+    parts.memory = Norm(f.mem, limits.memory)
+    parts.load = max(Norm(f.load, limits.load), Norm(f.burst, limits.burst))
+    parts.leak = f.leak and 0.5 or 0
     local frames, other, worst = 0, 0, nil
     for _, key in ipairs(FRAME_PARTS) do
         frames = max(frames, parts[key])
@@ -1083,108 +1178,312 @@ function ns.Judge(rec)
         end
     end
     local score = max(frames, other)
-    rec.score, rec.level = score, LevelOf(score)
-    if rec.level == 0 then
-        rec.kind = nil
-    elseif LevelOf(frames) == rec.level then
-        rec.kind = "frames"
+    out.score, out.level = score, LevelOf(score)
+    if out.level == 0 then
+        out.kind = nil
+    elseif LevelOf(frames) == out.level then
+        out.kind = "frames"
     else
-        rec.kind = KIND[worst]
+        out.kind = KIND[worst]
     end
-    rec.rank = rec.level * 100 + (rec.kind == "frames" and 50 or 0) + min(score, 4) * 10
-    return rec.level
+    out.rank = out.level * 100 + (out.kind == "frames" and 50 or 0) + min(score, 4) * 10
+    return out.level
+end
+
+function ns.Judge(rec)
+    local f = rec.figures or {}
+    f.ms, f.combat = ns.JudgedTime(rec)
+    f.rate, f.hitches = ns.SpikeRate(rec)
+    f.growth, f.mem = rec.growth, rec.mem
+    f.load, f.burst = ns.LoadTypical(rec), rec.loadPeak
+    f.leak, f.leakSeconds = ns.Leak(rec)
+    return Score(rec, f)
+end
+
+local function LoadOrBurst(f)
+    local limits = ns.LIMITS
+    return Norm(f.load, limits.load) >= Norm(f.burst, limits.burst)
 end
 
 local REASONS = {
-    cpu = function(rec)
-        local ms, combat = ns.JudgedTime(rec)
-        return ("%s ms of every frame%s"):format(ns.FormatMs(ms), combat and " in combat" or "")
+    cpu = function(f)
+        return ("%s ms of every frame%s"):format(ns.FormatMs(f.ms), f.combat and " in combat" or "")
     end,
-    spike = function(rec)
-        local rate, count = ns.SpikeRate(rec)
-        return ("ran over 50 ms in %d frames (%d an hour)"):format(count, rate + 0.5)
+    spike = function(f)
+        return ("ran over 50 ms in %d frames (%d an hour)"):format(f.hitches, f.rate + 0.5)
     end,
-    growth = function(rec)
-        return ("makes at least %s of new memory"):format(ns.FormatRate(rec.growth))
+    growth = function(f)
+        return ("makes at least %s of new memory"):format(ns.FormatRate(f.growth))
     end,
-    memory = function(rec)
-        return ("holds %s"):format(ns.FormatMemory(rec.mem))
+    memory = function(f)
+        return ("holds %s"):format(ns.FormatMemory(f.mem))
     end,
-    load = function(rec)
-        local limits = ns.LIMITS
-        local typical = ns.LoadTypical(rec)
-        if Norm(typical, limits.load) >= Norm(rec.loadPeak, limits.burst) then
-            return ("%s to load"):format(ns.FormatDuration(typical))
+    load = function(f)
+        if LoadOrBurst(f) then
+            return ("%s to load"):format(ns.FormatDuration(f.load))
         end
-        return ("ran %s in one go while loading"):format(ns.FormatDuration(rec.loadPeak))
+        return ("ran %s in one go while loading"):format(ns.FormatDuration(f.burst))
     end,
-    leak = function(rec)
-        local grown, seconds = ns.Leak(rec)
-        return ("holds %s more than %s ago (addons that cache data do this too)"):format(ns.FormatMemory(grown), ns.FormatClock(seconds))
+    leak = function(f)
+        return ("holds %s more than %s ago (addons that cache data do this too)"):format(ns.FormatMemory(f.leak), ns.FormatClock(f.leakSeconds))
     end,
 }
 local REASON_ORDER = { "cpu", "spike", "growth", "memory", "load", "leak" }
 
 local SHORT = {
-    cpu = function(rec)
-        local ms, combat = ns.JudgedTime(rec)
-        return ("%s ms %s"):format(ns.FormatMs(ms), combat and "in combat" or "a frame")
+    cpu = function(f)
+        return ("%s ms %s"):format(ns.FormatMs(f.ms), f.combat and "in combat" or "a frame")
     end,
-    spike = function(rec)
-        local _, count = ns.SpikeRate(rec)
-        return ("%d hitches"):format(count)
+    spike = function(f)
+        return ("%d hitches"):format(f.hitches)
     end,
-    growth = function(rec)
-        return ("%s new memory"):format(ns.FormatRate(rec.growth))
+    growth = function(f)
+        return ("%s new memory"):format(ns.FormatRate(f.growth))
     end,
-    memory = function(rec)
-        return ("%s held"):format(ns.FormatMemory(rec.mem))
+    memory = function(f)
+        return ("%s held"):format(ns.FormatMemory(f.mem))
     end,
-    load = function(rec)
-        local limits = ns.LIMITS
-        local typical = ns.LoadTypical(rec)
-        if Norm(typical, limits.load) >= Norm(rec.loadPeak, limits.burst) then
-            return ("%s to load"):format(ns.FormatDuration(typical))
+    load = function(f)
+        if LoadOrBurst(f) then
+            return ("%s to load"):format(ns.FormatDuration(f.load))
         end
-        return ("%s burst at login"):format(ns.FormatDuration(rec.loadPeak))
+        return ("%s burst at login"):format(ns.FormatDuration(f.burst))
     end,
-    leak = function(rec)
-        return ("kept %s it grew"):format(ns.FormatMemory((ns.Leak(rec))))
+    leak = function(f)
+        return ("kept %s it grew"):format(ns.FormatMemory(f.leak))
     end,
 }
 
+-- A session record is judged afresh; an all-time entry was scored when it was put together.
+local function Judged(item)
+    if not item.life then
+        ns.Judge(item)
+    end
+    return item.parts, item.figures
+end
+
+-- The measures at or over "noticeable", worst first, in words.
+function ns.Reasons(item)
+    local parts, figures = Judged(item)
+    local keys = {}
+    for _, key in ipairs(REASON_ORDER) do
+        if parts[key] >= 0.5 then
+            keys[#keys + 1] = key
+        end
+    end
+    table.sort(keys, function(a, b)
+        return parts[a] > parts[b]
+    end)
+    local out = {}
+    for i, key in ipairs(keys) do
+        out[i] = REASONS[key](figures)
+    end
+    return out
+end
+
 -- The measure furthest past its mark in a few words, and its level; nil for a light addon.
-function ns.ShortReason(rec)
-    ns.Judge(rec)
+function ns.ShortReason(item)
+    local parts, figures = Judged(item)
     local worst, score = nil, 0.5
     for _, key in ipairs(REASON_ORDER) do
-        if rec.parts[key] >= score and (not worst or rec.parts[key] > score) then
-            worst, score = key, rec.parts[key]
+        if parts[key] >= score and (not worst or parts[key] > score) then
+            worst, score = key, parts[key]
         end
     end
     if not worst then
         return nil, 0
     end
-    return SHORT[worst](rec), LevelOf(score)
+    return SHORT[worst](figures), LevelOf(score)
 end
 
--- The measures at or over "noticeable", worst first, in words.
-function ns.Reasons(rec)
-    ns.Judge(rec)
-    local keys = {}
-    for _, key in ipairs(REASON_ORDER) do
-        if rec.parts[key] >= 0.5 then
-            keys[#keys + 1] = key
+-- Saved figures ----------------------------------------------------------------------------
+-- What each addon cost over every session, kept in the saved settings. The session's own figures
+-- are added as they come in (ns.Flush), so a reload, a logout or a Reset loses nothing.
+
+local function Stats(rec)
+    local stats = db.stats[rec.name]
+    if not stats then
+        stats = { title = rec.title }
+        for _, key in ipairs(ns.STAT_NUMBERS) do
+            stats[key] = 0
+        end
+        stats.first = time()
+        db.stats[rec.name] = stats
+    end
+    return stats
+end
+
+function ns.Flush()
+    if not (db and startup.done) then
+        return
+    end
+    local now, wall = Clock(), time()
+    local totals = db.totals
+    if not ns.sessionCounted then
+        ns.sessionCounted = true
+        totals.sessions = totals.sessions + 1
+    end
+    totals.seconds = totals.seconds + max(0, (now - (ns.flushedAt or ns.trackedSince)) / 1000)
+    ns.flushedAt = now
+    for _, rec in ipairs(ns.list) do
+        if Tracked(rec) then
+            local stats = Stats(rec)
+            stats.title, stats.last, stats.removed = rec.title, wall, nil
+            if not rec.counted then
+                rec.counted = true
+                stats.sessions = stats.sessions + 1
+            end
+            local began = max(ns.trackedSince, rec.baseAt or ns.trackedSince)
+            stats.seconds = stats.seconds + max(0, (now - (rec.flushAt or began)) / 1000)
+            rec.flushAt = now
+            stats.n, stats.sum = stats.n + rec.n - (rec.flushedN or 0), stats.sum + rec.sum - (rec.flushedSum or 0)
+            stats.combatN = stats.combatN + rec.combatN - (rec.flushedCombatN or 0)
+            stats.combatSum = stats.combatSum + rec.combatSum - (rec.flushedCombatSum or 0)
+            rec.flushedN, rec.flushedSum, rec.flushedCombatN, rec.flushedCombatSum = rec.n, rec.sum, rec.combatN, rec.combatSum
+            -- Hitches are only known when the counters were just read; their hours run on their own clock.
+            local count = ns.Over(rec, SPIKE_BUCKET)
+            if count then
+                stats.hitches = stats.hitches + max(0, count - (rec.flushedHitches or 0))
+                stats.hitchSeconds = stats.hitchSeconds + max(0, (now - (rec.hitchFlushAt or began)) / 1000)
+                rec.flushedHitches, rec.hitchFlushAt = count, now
+            end
+            stats.stutters = stats.stutters + max(0, rec.stutters - (rec.flushedStutters or 0))
+            rec.flushedStutters = rec.stutters
+            local exact, band = ns.Peak(rec)
+            stats.peak, stats.band = max(stats.peak, exact or 0), max(stats.band, band or 0)
+            if rec.mem then
+                stats.mem, stats.memMax = rec.mem, max(stats.memMax, rec.mem)
+            end
+            if rec.loadPeak then
+                stats.burst = rec.loadPeak
+            end
         end
     end
-    table.sort(keys, function(a, b)
-        return rec.parts[a] > rec.parts[b]
-    end)
-    local out = {}
-    for i, key in ipairs(keys) do
-        out[i] = REASONS[key](rec)
+end
+
+-- Figures of addons that are no longer installed go, unless the player asked to keep them.
+function ns.PruneRemoved()
+    local own = ns.addons[ADDON]
+    if not (db and own and own.installed) then
+        return 0
     end
-    return out
+    local dropped = 0
+    for name, stats in pairs(db.stats) do
+        local rec = ns.addons[name]
+        if rec and rec.installed then
+            stats.removed = nil
+        elseif db.keepRemoved then
+            stats.removed = stats.removed or time()
+        else
+            db.stats[name], ns.life[name] = nil, nil
+            dropped = dropped + 1
+        end
+    end
+    for name in pairs(db.history) do
+        local rec = ns.addons[name]
+        if not (rec and rec.installed) and not db.keepRemoved then
+            db.history[name] = nil
+        end
+    end
+    return dropped
+end
+
+function ns.Forget(name)
+    db.stats[name], db.history[name], ns.life[name] = nil, nil, nil
+end
+
+-- Everything saved goes; the session under way carries on and is saved from here.
+function ns.ForgetAll()
+    ns.Flush()
+    db.stats, db.history, db.stutterLog, db.logins = {}, {}, {}, {}
+    db.totals = { sessions = 0, seconds = 0, since = time() }
+    ns.life, ns.sessionCounted = {}, nil
+    for _, rec in ipairs(ns.list) do
+        rec.counted = nil
+    end
+end
+
+function ns.OptionChanged(key)
+    if key == "keepRemoved" and startup.done then
+        ns.PruneRemoved()
+    end
+    if ns.view then
+        ns.view.dirty = true
+    end
+end
+
+-- One all-time entry per addon on record, scored like a session row.
+function ns.RefreshLife()
+    ns.Flush()
+    for name, stats in pairs(db.stats) do
+        local life = ns.life[name]
+        if not life then
+            life = { life = true, name = name }
+            ns.life[name] = life
+        end
+        local rec = ns.addons[name]
+        life.stats, life.title = stats, stats.title or name
+        life.loaded = rec ~= nil and Tracked(rec) or false
+        life.removed = stats.removed
+        life.average = stats.n > 0 and stats.sum / stats.n or nil
+        life.combat = stats.combatN > 0 and stats.combatSum / stats.combatN or nil
+        life.peak = stats.peak > 0 and stats.peak >= stats.band and stats.peak or nil
+        life.band = not life.peak and stats.band > 0 and stats.band or nil
+        life.hitches = stats.hitches
+        life.rate = stats.hitchSeconds > 0 and stats.hitches / max(stats.hitchSeconds / 3600, 1 / 60) or nil
+        life.mem = stats.mem > 0 and stats.mem or nil
+        local runs = db.history[name]
+        life.runs = runs and #runs or 0
+        life.load = life.runs > 0 and ns.Median(runs) or nil
+        local f = life.figures or {}
+        f.ms, f.combat = life.average or 0, false
+        if life.combat and stats.combatN >= COMBAT_MIN_SAMPLES and life.combat > f.ms then
+            f.ms, f.combat = life.combat, true
+        end
+        f.rate, f.hitches = life.rate, life.rate and stats.hitches or 0
+        f.mem, f.load, f.burst = life.mem, life.load, stats.burst > 0 and stats.burst or nil
+        Score(life, f)
+    end
+    for name in pairs(ns.life) do
+        if not db.stats[name] then
+            ns.life[name] = nil
+        end
+    end
+end
+
+local LIFE_SORTS = {
+    name = function(life) return life.title:lower() end,
+    weight = function(life) return life.rank or 0 end,
+    average = function(life) return life.average or -1 end,
+    combat = function(life) return life.combat or -1 end,
+    peak = function(life) return life.peak or life.band or -1 end,
+    spikes = function(life) return life.rate or -1 end,
+    memory = function(life) return life.mem or -1 end,
+    load = function(life) return life.load or -1 end,
+}
+ns.LIFE_SORTS = LIFE_SORTS
+
+function ns.LifeRows(sort, ascending, filter)
+    ns.RefreshLife()
+    local key = LIFE_SORTS[sort] or LIFE_SORTS.weight
+    filter = filter and filter ~= "" and filter:lower() or nil
+    local rows = {}
+    for name, life in pairs(ns.life) do
+        if not filter or life.title:lower():find(filter, 1, true) or name:lower():find(filter, 1, true) then
+            rows[#rows + 1] = life
+        end
+    end
+    table.sort(rows, function(a, b)
+        local x, y = key(a), key(b)
+        if x == y then
+            return a.name < b.name
+        end
+        if ascending then
+            return x < y
+        end
+        return x > y
+    end)
+    return rows
 end
 
 -- Rows and totals --------------------------------------------------------------------------
@@ -1355,6 +1654,28 @@ function ns.Report()
         Add("")
         Add("No frame over %d ms on record.", db.stutterMs)
     end
+    local life = ns.LifeRows("weight")
+    if #life > 0 then
+        local totals = db.totals
+        Add("")
+        Add("All time: %d sessions, %s measured since %s.", totals.sessions, ns.FormatClock(totals.seconds), date("%Y-%m-%d", totals.since))
+        Add("%s %7s %7s %7s %7s %9s %8s %5s  %s", ns.Fit("Addon", 28), "avg", "combat", "peak", "hit/h", "memory", "load", "sess", "verdict")
+        for _, item in ipairs(life) do
+            Add("%s %7s %7s %7s %7s %9s %8s %5d  %s%s", ns.Fit(item.title, 28), ns.FormatMs(item.average), ns.FormatMs(item.combat),
+                item.peak and ns.FormatMs(item.peak) or item.band and (">%d"):format(item.band) or "-",
+                item.rate and ("%d"):format(item.rate + 0.5) or "-", ns.FormatMemory(item.mem), ns.FormatDuration(item.load), item.stats.sessions,
+                item.level == 2 and "HEAVY: " .. table.concat(ns.Reasons(item), "; ") or item.level == 1 and "noticeable: " .. table.concat(ns.Reasons(item), "; ") or "light",
+                item.removed and " (removed)" or not item.loaded and " (not loaded)" or "")
+        end
+    end
+    local log = db.stutterLog
+    if #log > #stutters then
+        Add("")
+        Add("Saved stutters, earlier sessions included (the last %d):", #log)
+        for _, stutter in ipairs(log) do
+            Add("  %s %s", date("%m-%d", stutter.at), ns.DescribeStutter(stutter))
+        end
+    end
     return lines
 end
 
@@ -1365,7 +1686,7 @@ function ns.Status()
         ("profiler %s; clock %s; %d processor samples, %d memory scans (last took %s ms%s)"):format(
             ns.ProfilerEnabled() and "on" or cpu.failed and "failed: " .. tostring(cpu.error) or "off",
             GetTimePreciseSec and "GetTimePreciseSec" or "debugprofilestop", cpu.samples, memory.scans,
-            ns.FormatMs(memory.cost), memory.slow and ", so scans are spaced out" or ""),
+            ns.FormatMs(memory.cost), memory.slow and ", so scans only run behind loading screens, on opening the window and now and then while it is open" or ""),
         ("startup %s%s: %d loads timed, %d of them after a drawn frame; %d frames drawn while loading"):format(
             startup.done and "done" or startup.phase, startup.unlifted and " (the client never said the loading screen lifted)" or "",
             startup.loads, startup.split or 0, startup.frames),
@@ -1428,6 +1749,8 @@ function handlers.LOADING_SCREEN_DISABLED()
     end
     ns.loading = false
     ns.quietUntil = now + QUIET_AFTER_LOADING_MS
+    -- The seconds after a loading screen hide a scan's pause.
+    ns.memory.next = SCREEN_MEMORY_DELAY
     if startup.timedOut then
         -- The first word from the client that the login screen lifted: that was when the game was ready.
         startup.timedOut, startup.unlifted = nil, nil
@@ -1440,6 +1763,14 @@ function handlers.LOADING_SCREEN_DISABLED()
     end
 end
 
+-- Saved settings are written right after this event, on a logout and on a reload alike.
+function handlers.PLAYER_LOGOUT()
+    if startup.done then
+        ns.SampleCPU(true, true)
+        ns.Flush()
+    end
+end
+
 frame:SetScript("OnEvent", function(_, event, ...)
     handlers[event](...)
 end)
@@ -1448,4 +1779,5 @@ frame:RegisterEvent("PLAYER_LOGIN")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:RegisterEvent("LOADING_SCREEN_ENABLED")
 frame:RegisterEvent("LOADING_SCREEN_DISABLED")
+frame:RegisterEvent("PLAYER_LOGOUT")
 frame:SetScript("OnUpdate", OnUpdate)

@@ -159,6 +159,9 @@ local function CreateFrame(kind, name, parent, template)
     if template == "DefaultPanelTemplate" then
         frame.TitleContainer = { TitleText = wow.NewWidget("FontString") }
         frame.shown = true
+    elseif template == "PanelTabButtonTemplate" then
+        parent.Tabs = rawget(parent, "Tabs") or {}
+        parent.Tabs[#parent.Tabs + 1] = frame
     elseif template == "ColumnDisplayButtonShortTemplate" then
         frame.Text = wow.NewWidget("FontString", nil, frame)
     elseif template == "InputScrollFrameTemplate" then
@@ -257,6 +260,8 @@ function wow.Reset(options)
     G.GameTooltip_Hide = function() G.GameTooltip:Hide() end
     G.GameTooltip_AddInstructionLine = function(tooltip, text) tooltip:AddLine(text) end
     G.GameTooltip_AddNormalLine = function(tooltip, text) tooltip:AddLine(text) end
+    G.PanelTemplates_SetNumTabs = function(frame, count) frame.numTabs = count end
+    G.PanelTemplates_SetTab = function(frame, id) frame.selectedTab = id end
     G.PixelUtil = { GetNearestPixelSize = function(value) return math.floor(value + 0.5) end }
     G.PlaySound = NoOp
     G.SOUNDKIT = setmetatable({}, { __index = function() return 1 end })
@@ -498,7 +503,7 @@ end
 function wow.Start(options)
     options = options or {}
     wow.Reset(options)
-    wow.Install({ name = ADDON, title = "Addon Weight", version = "1.0.0" })
+    wow.Install({ name = ADDON, title = "Addon Weight", version = "1.1.0" })
     for _, addon in ipairs(options.addons or {}) do
         wow.Install(addon)
         if addon.before then
@@ -550,6 +555,9 @@ function wow.Finish(options)
 end
 
 function wow.Reload(options)
+    if wow.ns then
+        wow.Fire("PLAYER_LOGOUT")
+    end
     options = options or {}
     options.keepDB, options.reload = true, true
     return wow.Start(options)

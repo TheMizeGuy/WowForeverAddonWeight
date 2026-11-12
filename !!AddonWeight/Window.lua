@@ -1,6 +1,6 @@
 local ADDON, ns = ...
 
-local view = { sort = "weight", ascending = false, filter = "", wait = 0, dirty = true, rows = {}, position = {} }
+local view = { scope = "session", sort = "weight", ascending = false, filter = "", wait = 0, dirty = true, rows = {}, position = {} }
 ns.view = view
 
 -- Offsets are multiples of 5 so each lands on a whole pixel at 1.2 pixels per unit (1440p, default scale).
@@ -14,19 +14,25 @@ local ALERT = "|TInterface\\DialogFrame\\DialogIcon-AlertNew-16:16:16|t"
 
 local COLUMNS = {
     { key = "name", label = "Addon", width = 180, left = true,
-        tip = "Every addon loaded now. Hover a row for all its figures; right-click it to disable it." },
+        tip = "Every addon loaded now. Hover a row for all its figures; right-click it to disable it.",
+        allTip = "Every addon with saved figures: loaded now, switched off, or (if you keep them) removed. Hover a row for all of it." },
     { key = "average", label = "Average ms", width = 75,
-        tip = "Processor time the game's profiler charges to this addon in each frame, averaged since login, reload or Reset. At 60 fps a whole frame is 16.7 ms." },
+        tip = "Processor time the game's profiler charges to this addon in each frame, averaged since login, reload or Reset. At 60 fps a whole frame is 16.7 ms.",
+        allTip = "Processor time the game's profiler charges to this addon in each frame, averaged over every session on record. At 60 fps a whole frame is 16.7 ms." },
     { key = "combat", label = "Combat ms", width = 75,
         tip = "The same, counting only time in combat." },
     { key = "peak", label = "Peak ms", width = 65,
-        tip = "Its worst single frame since tracking began, loading screens left out. >100 means a frame ran over 100 ms and the exact figure is not known." },
-    { key = "spikes", label = "Hitches", width = 60,
-        tip = "Frames in which this addon's own work ran over 50 ms. Each one is a hitch you can feel. Loading screens are left out." },
+        tip = "Its worst single frame since tracking began, loading screens left out. >100 means a frame ran over 100 ms and the exact figure is not known.",
+        allTip = "Its worst single frame in any session, loading screens left out. >100 means a frame ran over 100 ms and the exact figure is not known." },
+    { key = "spikes", label = "Hitches", width = 60, allLabel = "Hitches/h",
+        tip = "Frames in which this addon's own work ran over 50 ms. Each one is a hitch you can feel. Loading screens are left out.",
+        allTip = "Frames in which this addon's own work ran over 50 ms, for each hour it was measured, over every session." },
     { key = "memory", label = "Memory MB", width = 75,
-        tip = "Memory charged to the addon at the last scan. Held memory alone does not lower your frame rate; making new memory fast (in the row's tooltip) can." },
+        tip = "Memory charged to the addon at the last scan. Held memory alone does not lower your frame rate; making new memory fast (in the row's tooltip) can.",
+        allTip = "Memory charged to the addon when it was last measured." },
     { key = "load", label = "Load ms", width = 60,
-        tip = "Time from the addon before it finishing to this one finishing at the last login or reload: its files and saved settings. ~ marks an estimate for an addon loaded on demand." },
+        tip = "Time from the addon before it finishing to this one finishing at the last login or reload: its files and saved settings. ~ marks an estimate for an addon loaded on demand.",
+        allTip = "The middle one of its last five load times." },
     { key = "weight", label = "Why", width = 140, left = true,
         tip = "The measure furthest past its mark. Worst rows first, frame-rate problems above memory and loading; blank means nothing stands out. The alert icon marks a heavy addon." },
 }
@@ -101,6 +107,52 @@ local CELLS = {
     end,
 }
 ns.CELLS = CELLS
+
+local function MemoryCell(kb)
+    if not kb then
+        return "-", 0, nil
+    end
+    local mb = kb / 1024
+    return mb > 0 and mb < 0.05 and "<0.1" or ("%.1f"):format(mb), ns.Level(kb, ns.LIMITS.memory), kb
+end
+
+-- The same cells for an all-time entry (ns.RefreshLife).
+local LIFE_CELLS = {
+    average = function(life)
+        return CellMs(life.average), ns.Level(life.average, ns.LIMITS.cpu), life.average
+    end,
+    combat = function(life)
+        return CellMs(life.combat), ns.Level(life.combat, ns.LIMITS.cpu), life.combat
+    end,
+    peak = function(life)
+        if life.peak then
+            return ("%.1f"):format(life.peak), PeakLevel(life.peak), life.peak
+        elseif life.band then
+            return (">%d"):format(life.band), PeakLevel(life.band), life.band
+        end
+        return "-", 0, nil
+    end,
+    spikes = function(life)
+        if not life.rate then
+            return "-", 0, nil
+        end
+        return ("%d"):format(life.rate + 0.5), (ns.SpikeScore(life.rate, life.hitches)), life.rate
+    end,
+    memory = function(life)
+        return MemoryCell(life.mem)
+    end,
+    load = function(life)
+        if not life.load then
+            return "-", 0, nil
+        end
+        return ("%d"):format(life.load + 0.5), ns.Level(life.load, ns.LIMITS.load), life.load
+    end,
+    weight = function(life)
+        local text, level = ns.ShortReason(life)
+        return text or "", level, life.rank
+    end,
+}
+ns.LIFE_CELLS = LIFE_CELLS
 
 -- Tiles ------------------------------------------------------------------------------------
 -- One answer each: the heaviest addon on frame rate, on stutters, on memory and on loading.
@@ -202,13 +254,104 @@ local function LoadTile(summary)
     return tile
 end
 
-function ns.Tiles()
-    local summary = ns.Summary()
+-- The same four answers over every session on record.
+local function LifeTiles()
+    local rows = {}
+    for _, life in pairs(ns.life) do
+        rows[#rows + 1] = life
+    end
+    local best = {}
+    local function Top(key, value, life)
+        if life.name ~= ADDON and value and value > 0 and (not best[key] or value > best[key].value) then
+            best[key] = { value = value, life = life }
+        end
+    end
+    for _, life in ipairs(rows) do
+        Top("frames", life.figures.ms, life)
+        Top("stutters", life.stats.stutters, life)
+        Top("memory", life.mem, life)
+        Top("load", life.load, life)
+    end
+    local function Tile(label, key, none)
+        local tile = { label = label }
+        if not best[key] then
+            tile.name, tile.grey = none, true
+        end
+        return tile, best[key] and best[key].life
+    end
+    local frames, life = Tile("Frame rate", "frames", "No figures yet")
+    if life then
+        local f = life.figures
+        frames.name, frames.level = life.title, ns.Level(f.ms, ns.LIMITS.cpu)
+        frames.value = f.combat and ("%s ms a frame in combat"):format(ns.FormatMs(f.ms)) or ("%s ms of every frame"):format(ns.FormatMs(f.ms))
+        frames.grey = frames.level == 0
+        frames.detail = frames.grey and "Nothing stands out"
+            or ("Over %d session%s, %s measured"):format(life.stats.sessions, life.stats.sessions == 1 and "" or "s", ns.FormatClock(life.stats.seconds))
+    end
+    local stutters
+    stutters, life = Tile("Stutters", "stutters", "No stutters")
+    if life then
+        stutters.name, stutters.level = life.title, 2
+        stutters.value = ("took most of %d stutter%s"):format(life.stats.stutters, life.stats.stutters == 1 and "" or "s")
+        stutters.detail = ("since %s"):format(date("%Y-%m-%d", life.stats.first))
+    else
+        stutters.value = "None blamed on one addon"
+    end
+    local memory
+    memory, life = Tile("Memory", "memory", "No figures yet")
+    if life then
+        memory.name, memory.level = life.title, ns.Level(life.mem, ns.LIMITS.memory)
+        memory.value = ("%s when last measured"):format(ns.FormatMemory(life.mem))
+        memory.grey = memory.level == 0
+        memory.detail = memory.grey and "Nothing stands out" or ("At most %s"):format(ns.FormatMemory(life.stats.memMax))
+    end
+    local loading
+    loading, life = Tile("Loading", "load", "No figures yet")
+    if life then
+        loading.name, loading.level = life.title, ns.Level(life.load, ns.LIMITS.load)
+        loading.value = ("%s to load"):format(ns.FormatDuration(life.load))
+        loading.grey = loading.level == 0
+        loading.detail = loading.grey and "Nothing stands out"
+            or ("The middle of its last %d login%s"):format(life.runs, life.runs == 1 and "" or "s")
+    end
+    return { frames, stutters, memory, loading }
+end
+
+local function LifeContext()
+    local totals = ns.db.totals
+    local count, removed = 0, 0
+    for _, life in pairs(ns.life) do
+        count = count + 1
+        if life.removed then
+            removed = removed + 1
+        end
+    end
+    return ("All time: %d session%s and %s measured since %s. %d addon%s on record%s."):format(totals.sessions, totals.sessions == 1 and "" or "s",
+        ns.FormatClock(totals.seconds), date("%Y-%m-%d", totals.since), count, count == 1 and "" or "s",
+        removed > 0 and (", %d of them removed"):format(removed) or "")
+end
+
+-- `fresh` says the caller has just refreshed the figures (a summary for the session, or the
+-- all-time entries), so they are not put together twice in one refresh.
+function ns.Tiles(scope, fresh)
+    if scope == "all" then
+        if not fresh then
+            ns.RefreshLife()
+        end
+        return LifeTiles()
+    end
+    local summary = fresh or ns.Summary()
     return { FrameTile(summary), StutterTile(summary), MemoryTile(summary), LoadTile(summary) }
 end
 
-function ns.ContextLine()
-    local summary = ns.Summary()
+function ns.ContextLine(scope, fresh)
+    if scope == "all" then
+        if not fresh then
+            ns.RefreshLife()
+        end
+        return LifeContext()
+    end
+    local summary = fresh or ns.Summary()
     local measured = ("Measured over %s."):format(ns.FormatClock(summary.tracked))
     if not ns.ProfilerEnabled() then
         return ("%.0f fps. The addon profiler is off, so there are no frame times. %s"):format(summary.fps, measured)
@@ -309,10 +452,82 @@ function ns.RowTooltipLines(rec)
     return lines
 end
 
+function ns.LifeTooltipLines(life)
+    local lines = {}
+    local function Add(left, right, level)
+        lines[#lines + 1] = { left, right, level }
+    end
+    local stats, limits = life.stats, ns.LIMITS
+    Add("Measured", ("%d session%s, %s"):format(stats.sessions, stats.sessions == 1 and "" or "s", ns.FormatClock(stats.seconds)))
+    Add("First and last seen", ("%s, %s"):format(date("%Y-%m-%d", stats.first), date("%Y-%m-%d", stats.last)))
+    if life.average then
+        Add("Average", ns.FormatMs(life.average) .. " ms a frame", ns.Level(life.average, limits.cpu))
+    end
+    if life.combat then
+        Add("In combat", ns.FormatMs(life.combat) .. " ms a frame", ns.Level(life.combat, limits.cpu))
+    end
+    if life.peak then
+        Add("Worst frame", ns.FormatMs(life.peak) .. " ms", PeakLevel(life.peak))
+    elseif life.band then
+        Add("Worst frame", ("over %d ms"):format(life.band), PeakLevel(life.band))
+    end
+    if life.rate then
+        Add("Hitches", ("%d, %d an hour"):format(stats.hitches, life.rate + 0.5), (ns.SpikeScore(life.rate, stats.hitches)))
+    end
+    if stats.stutters > 0 then
+        Add("Stutters it took most of", tostring(stats.stutters), 2)
+    end
+    if life.mem then
+        Add("Memory", ("%s when last measured (at most %s)"):format(ns.FormatMemory(life.mem), ns.FormatMemory(stats.memMax)), ns.Level(life.mem, limits.memory))
+    end
+    if life.load then
+        Add("Load", ("%s, the middle of its last %d"):format(ns.FormatDuration(life.load), life.runs), ns.Level(life.load, limits.load))
+    end
+    if stats.burst >= 1 then
+        Add("Longest burst of work while loading", ns.FormatDuration(stats.burst), ns.Level(stats.burst, limits.burst))
+    end
+    return lines
+end
+
+local function ShowLifeTooltip(row)
+    local life = row.rec
+    GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+    GameTooltip:SetText(life.title, 1, 1, 1)
+    if life.name ~= life.title then
+        GameTooltip:AddLine(life.name, 0.5, 0.5, 0.5)
+    end
+    local reasons = ns.Reasons(life)
+    local color = LEVEL_COLOR[life.level or 0]
+    if #reasons > 0 then
+        GameTooltip:AddLine(LEVEL_WORD[life.level] .. " over all sessions: " .. table.concat(reasons, "; ") .. ".", color[1], color[2], color[3], true)
+    else
+        GameTooltip:AddLine("Nothing stands out over all sessions.", 1, 1, 1, true)
+    end
+    GameTooltip:AddLine(" ")
+    for _, line in ipairs(ns.LifeTooltipLines(life)) do
+        local c = LEVEL_COLOR[line[3] or 0]
+        GameTooltip:AddDoubleLine(line[1], line[2], 1, 0.82, 0, c[1], c[2], c[3])
+    end
+    GameTooltip:AddLine(" ")
+    if life.removed then
+        GameTooltip:AddLine(("Removed; last seen %s."):format(date("%Y-%m-%d", life.stats.last)), 0.5, 0.5, 0.5)
+        GameTooltip_AddInstructionLine(GameTooltip, "Right-click to forget its figures.")
+    elseif not life.loaded then
+        GameTooltip:AddLine("Not loaded this session.", 0.5, 0.5, 0.5)
+        GameTooltip_AddInstructionLine(GameTooltip, "Right-click to forget its figures.")
+    elseif life.name ~= ADDON then
+        GameTooltip_AddInstructionLine(GameTooltip, "Right-click to disable it and reload.")
+    end
+    GameTooltip:Show()
+end
+
 local function ShowRowTooltip(row)
     local rec = row.rec
     if not rec then
         return
+    end
+    if rec.life then
+        return ShowLifeTooltip(row)
     end
     GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
     GameTooltip:SetText(rec.title, 1, 1, 1)
@@ -367,6 +582,32 @@ local function AskDisable(rec)
     end)
 end
 
+local function AskForget(life)
+    local title = life.title:gsub("%%", "%%%%")
+    StaticPopup_ShowGenericConfirmation(("Forget every saved figure about %s?"):format(title), function()
+        ns.Forget(life.name)
+        view.dirty = true
+    end)
+end
+
+function ns.AskForgetAll()
+    StaticPopup_ShowGenericConfirmation("Forget every figure Addon Weight has saved, for every addon?\n\nThe session under way carries on.", function()
+        ns.ForgetAll()
+        view.dirty = true
+        ns.Say("Everything saved is forgotten.")
+    end)
+end
+
+local function OnRowClick(item)
+    if not item.life then
+        AskDisable(item)
+    elseif item.loaded then
+        AskDisable(ns.addons[item.name])
+    else
+        AskForget(item)
+    end
+end
+
 local function BuildRow(row)
     row.cells = {}
     -- A button's normal texture draws on the artwork layer, over the bar and level with the text.
@@ -404,7 +645,7 @@ local function BuildRow(row)
     end)
     row:SetScript("OnClick", function(self)
         if self.rec then
-            AskDisable(self.rec)
+            OnRowClick(self.rec)
         end
     end)
 end
@@ -419,14 +660,18 @@ local function InitRow(row, rec)
         stripe:SetAtlas((view.position[rec] or 1) % 2 == 1 and "auctionhouse-rowstripe-1" or "auctionhouse-rowstripe-2")
     end
     local heavy = rec.level == 2
+    local away = rec.life and not rec.loaded
     row.cells.name:SetWidth(COLUMNS[1].width - (heavy and 36 or 16))
-    row.cells.name:SetText(rec.title)
+    row.cells.name:SetText(away and ("%s (%s)"):format(rec.title, rec.removed and "removed" or "not loaded") or rec.title)
+    local nameColor = away and GREY or WHITE
+    row.cells.name:SetTextColor(nameColor[1], nameColor[2], nameColor[3])
     row.alert:SetShown(heavy)
+    local cells = rec.life and LIFE_CELLS or CELLS
     local barShown = false
     for _, column in ipairs(COLUMNS) do
         if column.key ~= "name" then
             local cell = row.cells[column.key]
-            local text, level, value = CELLS[column.key](rec)
+            local text, level, value = cells[column.key](rec)
             cell:SetText(text)
             local color = level > 0 and LEVEL_COLOR[level] or (not value or value <= 0) and GREY or WHITE
             cell:SetTextColor(color[1], color[2], color[3])
@@ -458,7 +703,8 @@ local function SameOrder(a, b)
 end
 
 local function ShowTiles()
-    for i, tile in ipairs(ns.Tiles()) do
+    local fresh = view.scope == "all" or ns.Summary()
+    for i, tile in ipairs(ns.Tiles(view.scope, fresh)) do
         local widget = window.tiles[i]
         widget.label:SetText(tile.label)
         widget.name:SetText(tile.level == 2 and ALERT .. " " .. tile.name or tile.name)
@@ -469,21 +715,31 @@ local function ShowTiles()
         widget.value:SetTextColor(valueColor[1], valueColor[2], valueColor[3])
         widget.detail:SetText(tile.detail or "")
     end
-    window.context:SetText(ns.ContextLine())
+    window.context:SetText(ns.ContextLine(view.scope, fresh))
 end
 
 local function Update()
     if not window then
         return
     end
+    local all = view.scope == "all"
     local frozen = not view.dirty and window.scrollBox:IsMouseOver()
-    local rows = frozen and view.rows or ns.Rows(view.sort, view.ascending, view.filter)
+    local rows
     if frozen then
-        for _, rec in ipairs(rows) do
-            ns.Judge(rec)
+        rows = view.rows
+        if all then
+            ns.RefreshLife()
+        else
+            for _, rec in ipairs(rows) do
+                ns.Judge(rec)
+            end
         end
+    elseif all then
+        rows = ns.LifeRows(view.sort, view.ascending, view.filter)
+    else
+        rows = ns.Rows(view.sort, view.ascending, view.filter)
     end
-    local cell = CELLS[view.sort]
+    local cell = (all and LIFE_CELLS or CELLS)[view.sort]
     view.max = 0
     for i, rec in ipairs(rows) do
         view.position[rec] = i
@@ -506,10 +762,12 @@ local function Update()
     end
     ShowTiles()
     if #rows == 0 then
-        window.empty:SetText(view.filter ~= "" and ("No addon matches \"%s\"."):format(view.filter) or "No other addons are loaded.")
+        window.empty:SetText(view.filter ~= "" and ("No addon matches \"%s\"."):format(view.filter)
+            or all and "Nothing is saved yet." or "No other addons are loaded.")
     end
     window.empty:SetShown(#rows == 0)
     for _, header in ipairs(window.headers) do
+        header:SetText(all and header.column.allLabel or header.column.label)
         local sorted = header.column.key == view.sort
         header.arrow:SetShown(sorted)
         if sorted then
@@ -531,6 +789,20 @@ function ns.Refresh(elapsed)
     if view.wait <= 0 or view.dirty then
         view.wait = 1
         Update()
+    end
+end
+
+local SCOPES = { "session", "all" }
+
+local function SetScope(scope)
+    view.scope = scope == "all" and "all" or "session"
+    ns.db.window.scope = view.scope
+    view.dirty, view.hover = true, nil
+    if window then
+        PanelTemplates_SetTab(window, view.scope == "all" and 2 or 1)
+        if window:IsShown() then
+            Update()
+        end
     end
 end
 
@@ -647,8 +919,13 @@ local function BuildHeaders()
         end)
         header:SetScript("OnEnter", function(self)
             GameTooltip:SetOwner(self, "ANCHOR_TOP")
-            GameTooltip:SetText(column.label, 1, 1, 1)
-            GameTooltip_AddNormalLine(GameTooltip, column.tip, true)
+            local all = view.scope == "all"
+            GameTooltip:SetText(all and column.allLabel or column.label, 1, 1, 1)
+            GameTooltip_AddNormalLine(GameTooltip, all and column.allTip or column.tip, true)
+            if column.key == "memory" and ns.memory.slow then
+                GameTooltip_AddNormalLine(GameTooltip, ("Measuring memory stops the game for %s ms with your addons, so it is done behind loading screens, when this window opens, and every %d seconds while it is open."):format(
+                    ns.FormatMs(ns.memory.cost), ns.MemoryInterval(true)), true)
+            end
             GameTooltip:Show()
         end)
         header:SetScript("OnLeave", GameTooltip_Hide)
@@ -727,6 +1004,21 @@ local function BuildWindow()
     end)
     options:SetPoint("BOTTOMRIGHT", -4, 4)
 
+    for i, label in ipairs({ "This session", "All time" }) do
+        local tab = CreateFrame("Button", nil, window, "PanelTabButtonTemplate")
+        tab:SetID(i)
+        tab:SetText(label)
+        if i == 1 then
+            tab:SetPoint("TOPLEFT", window, "BOTTOMLEFT", 11, 2)
+        end
+        tab:SetScript("OnClick", function()
+            SetScope(SCOPES[i])
+            PlaySound(SOUNDKIT.IG_CHARACTER_INFO_TAB)
+        end)
+    end
+    PanelTemplates_SetNumTabs(window, 2)
+    PanelTemplates_SetTab(window, view.scope == "all" and 2 or 1)
+
     window:SetScript("OnShow", function()
         ns.Watch(true)
         view.dirty, view.wait = true, 1
@@ -740,18 +1032,25 @@ local function BuildWindow()
     end)
 end
 
-function ns.Toggle()
+-- With a scope ("session" or "all") the window opens on that tab; without one it opens or closes.
+function ns.Toggle(scope)
     if not ns.db then
         return
     end
     if not window then
-        local sort = ns.db.window.sort
-        if type(sort) == "string" and ns.SORTS[sort] then
-            view.sort, view.ascending = sort, ns.db.window.ascending == true
+        local saved = ns.db.window
+        if type(saved.sort) == "string" and ns.SORTS[saved.sort] then
+            view.sort, view.ascending = saved.sort, saved.ascending == true
         end
+        view.scope = saved.scope == "all" and "all" or "session"
         BuildWindow()
     end
-    window:SetShown(not window:IsShown())
+    if scope then
+        SetScope(scope)
+        window:Show()
+    else
+        window:SetShown(not window:IsShown())
+    end
 end
 
 function ns.ShowReport()

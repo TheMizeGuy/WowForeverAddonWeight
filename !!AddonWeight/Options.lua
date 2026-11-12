@@ -35,6 +35,11 @@ local CONTROLS = {
         label = "Say the load time in chat after loading",
         tooltip = "One line after each login or reload: how long your addons took to load and which was slowest.",
     },
+    {
+        key = "keepRemoved",
+        label = "Keep the figures of addons you remove",
+        tooltip = "The All time tab keeps what every addon cost across sessions. Off, an addon you delete from your AddOns folder leaves that list at the next login. On, it stays, marked as removed, until you right-click it and forget it.",
+    },
 }
 
 local function MsLabel(value)
@@ -52,6 +57,9 @@ function ns.RegisterSettings(db)
         local variable = "ADDONWEIGHT_" .. control.key:upper()
         local varType = control.slider and Settings.VarType.Number or Settings.VarType.Boolean
         local setting = Settings.RegisterAddOnSetting(category, variable, control.key, db, varType, control.label, ns.DEFAULTS[control.key])
+        setting:SetValueChangedCallback(function()
+            ns.OptionChanged(control.key)
+        end)
         if control.slider then
             local options = Settings.CreateSliderOptions(control.slider[1], control.slider[2], control.slider[3])
             if options.SetLabelFormatter and MinimalSliderWithSteppersMixin and MinimalSliderWithSteppersMixin.Label then
@@ -108,10 +116,19 @@ local COMMANDS = {
         ns.OpenOptions()
     end,
     help = function()
-        ns.Say("/weight opens the window. /weight top names the heaviest addons in chat. /weight report gives the whole table as text to copy. /weight reset starts the averages over. /weight config opens the settings. /weight status is for troubleshooting.")
+        ns.Say("/weight opens the window (/weight all on its All time tab). /weight top names the heaviest addons in chat. /weight report gives every table as text to copy. /weight reset starts the session's averages over. /weight forget clears everything saved. /weight config opens the settings. /weight status is for troubleshooting.")
     end,
     copy = function()
         ns.ShowReport()
+    end,
+    session = function()
+        ns.Toggle("session")
+    end,
+    all = function()
+        ns.Toggle("all")
+    end,
+    forget = function()
+        ns.AskForgetAll()
     end,
 }
 COMMANDS.settings, COMMANDS.options = COMMANDS.config, COMMANDS.config
