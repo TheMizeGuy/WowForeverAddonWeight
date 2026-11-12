@@ -81,7 +81,7 @@ watch for stutters (on) and the frame length that counts as one (100 ms), say ea
 | Hitches (frames it ran over 50 ms) | 2 seen and 6 an hour | 5 seen and 60 an hour | frames |
 | New memory | 50 KB/s | 250 KB/s | frames |
 | Memory held | 50 MB | 200 MB | memory |
-| Load time (the middle one of the last five logins, once there are three) | 150 ms | 500 ms | loading |
+| Load time (the middle one of the last five logins, once there are three) | 250 ms | 1 s | loading |
 | Longest burst of work while loading | 250 ms | 1 s | loading |
 
 At 60 frames per second a frame is 16.7 ms, so 1 ms is 6% of it; at 144 it is 14%. An addon whose

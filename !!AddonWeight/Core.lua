@@ -44,7 +44,7 @@ ns.LIMITS = {
     cpu = { 0.5, 1.0 },          -- ms per frame, averaged
     growth = { 50, 250 },        -- KB per second
     memory = { 51200, 204800 },  -- KB
-    load = { 150, 500 },         -- ms, files and saved settings
+    load = { 250, 1000 },        -- ms, files and saved settings
     burst = { 250, 1000 },       -- ms in one go while loading
 }
 -- Frames the addon alone ran over 50 ms: { seen at least, an hour at least }.
